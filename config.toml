@@ -1,0 +1,7 @@
+[header]
+msg = "Socket started."
+
+[auth]
+token = "GRS0D5vK0ymAcBFsKt2KVwLoKott970G"
+
+[websocket]
