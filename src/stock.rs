@@ -29,6 +29,7 @@ pub struct RetryConfig {
     pub max_attempts: u32,
     pub base_delay_ms: u64,
     pub max_delay_ms: u64,
+    pub rate_limit_per_second: u32,
 }
 
 impl Default for RetryConfig {
@@ -37,6 +38,7 @@ impl Default for RetryConfig {
             max_attempts: 3,
             base_delay_ms: 1000,
             max_delay_ms: 10000,
+            rate_limit_per_second: 50,
         }
     }
 }
@@ -53,6 +55,7 @@ pub enum FetchType {
     SplitHistory,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Stock{
     pub symbol: String,
     pub exchange: String,
@@ -326,41 +329,76 @@ impl StockPolling {
             ));
         }
     
+        // Configurable concurrency limit
+        let concurrency_limit = 10; // Adjust as needed
+        let semaphore = Arc::new(Semaphore::new(concurrency_limit));
         let retry_config = RetryConfig::default();
-        let mut results = Vec::new();
+    
+        let start = Instant::now();
+        let mut tasks = Vec::new();
+
+        // Shared self
+        let shared_self = Arc::new(Self::new());
     
         for ticker in tickers {
-            let operation = || async {
-                match fetch_type {
-                    FetchType::Quote => self.quote(&ticker).await,
-                    FetchType::Financial => self.financial(&ticker).await,
-                    FetchType::Profile => self.profile(&ticker).await,
-                    FetchType::Rating => self.rating(&ticker).await,
-                    FetchType::CurrentPrice => self.current_price(&ticker).await,
-                    FetchType::History => self.history(&ticker, None, None, None, None).await,
-                    FetchType::DividendHistory => self.dividend_history(&ticker, None, None, None, None).await,
-                    FetchType::SplitHistory => self.split_history(&ticker, None, None, None, None).await,
-                    _ => unreachable!(),
-                }
-            };
+            let permit = semaphore.clone().acquire_owned().await.unwrap(); // Acquire semaphore permit
+            let retry_config = retry_config.clone(); // Clone retry config for each task
+            let fetch_type = fetch_type.clone(); // Clone fetch type
+            let ticker = ticker.clone(); // Clone ticker for task
+
+            //Recursively clone Self
+            let self_clone = Arc::clone(&shared_self);   
     
-            let result = Self::retry(&retry_config, operation).await;
+            let task = tokio::spawn(async move {
+                let operation = || async {
+                    match fetch_type {
+                        FetchType::Quote => self_clone.quote(&ticker).await,
+                        FetchType::Financial => self_clone.financial(&ticker).await,
+                        FetchType::Profile => self_clone.profile(&ticker).await,
+                        FetchType::Rating => self_clone.rating(&ticker).await,
+                        FetchType::CurrentPrice => self_clone.current_price(&ticker).await,
+                        FetchType::History => self_clone.history(&ticker, None, None, None, None).await,
+                        FetchType::DividendHistory => self_clone.dividend_history(&ticker, None, None, None, None).await,
+                        FetchType::SplitHistory => self_clone.split_history(&ticker, None, None, None, None).await,
+                        _ => unreachable!(),
+                    }
+                };
     
-            match result {
-                Ok(value) => {
-                    counter!("stock.success").increment(1);
-                    results.push(value);
+                let result = Self::retry(&retry_config, operation).await;
+    
+                // Release semaphore automatically when task completes
+                drop(permit);
+    
+                match result {
+                    Ok(value) => {
+                        counter!("stock.success").increment(1);
+                        value
+                    }
+                    Err(e) => {
+                        error!("Failed to fetch data for {}: {:?}", ticker, e);
+                        counter!("stock.failures").increment(1);
+                        Value::Null
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to fetch data for {}: {:?}", ticker, e);
-                    counter!("stock.failures").increment(1);
-                    results.push(Value::Null);
-                }
+            });
+    
+            tasks.push(task);
+        }
+    
+        // Await all tasks
+        let mut results = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok(value) => results.push(value),
+                Err(_) => results.push(Value::Null), // Task panicked
             }
         }
     
+        let elapsed = start.elapsed();
+        gauge!("stock.batch_time", "rate limit" => format!("{}", elapsed.as_secs_f64()));
+    
         Ok(Value::Array(results))
-    }
+    }    
 
     pub async fn poll(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<(), StockError> {
         let config = Arc::clone(&self.batch_config);
