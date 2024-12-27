@@ -6,201 +6,396 @@ use std::collections::HashMap;
 
 use crate::request::{make_request, generate_json};
 use crate::financial::Financial;
-use serde_json::{json, Value};
+use serde::de::value;
+use tokio::time::sleep;
+use serde_json::{json, to_value, Value};
+use tokio::sync::Semaphore;
+use std::time::{Duration, Instant};
+use metrics::{counter, gauge};
+use tracing::{info, error};
+use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use futures_util::Future;
+use std::fmt::Display;
+use lru::LruCache;
+use tokio::sync::Mutex;
+use thiserror::Error;
+
+use crate::auth_config::BatchConfig;
+
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 1000,
+            max_delay_ms: 10000,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum FetchType {
+    Quote,
+    Financial,
+    Profile,
+    Rating,
+    CurrentPrice,
+    History,
+    DividendHistory,
+    SplitHistory,
+}
+
+pub struct Stock{
+    pub symbol: String,
+    pub exchange: String,
+    pub exchange_short_name: String,
+    pub price: String,
+    pub name: String,
+}
+
+#[derive(Debug, Error)]
+pub enum StockError {
+    #[error("Failed to fetch data: {0}")]
+    FetchError(String),
+    
+    #[error("Task encountered an error: {0}")]
+    TaskError(String),
+    
+    #[error("Failed to parse data: {0}")]
+    ParseError(String),
+    
+    #[error("No tickers provided: {0}")]
+    VoidTickersError(String),
+}
 
 /// Functions for accessing stock-related data from the FMP API.
-pub struct Stock<'a> {
-    symbol: &'a str,
+pub struct StockPolling {
+   cache: Arc<Mutex<LruCache<String, (Value, Instant)>>>,
+   batch_config: Arc<BatchConfig>,
 }
 
-impl<'a> Stock<'a> {
-    /// Creates a new Stock instance for a specific stock symbol.
-    ///
-    /// ## Arguments
-    ///
-    /// * `symbol` - The stock symbol to get data for
-    pub fn new(symbol: &'a str) -> Self {
-        Self { symbol }
+impl StockPolling {
+    pub fn new() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))),
+            batch_config: Arc::new(BatchConfig::default()),
+        }
     }
 
-    pub async fn list() -> Result<Value, reqwest::Error> {
-        make_request("stock/list", HashMap::new()).await
-    }
-    /// Gets company profile information.
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
-    pub async fn profile(&self) -> Result<Value, reqwest::Error> {
-        make_request(
-            "company/profile",
-            generate_json(Value::String(self.symbol.to_string()), None)
-        ).await
-    }
-
-    /// Gets current stock quote.
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
-    pub async fn quote(&self) -> Result<Value, reqwest::Error> {
-        make_request(
-            "quote",
-            generate_json(Value::String(self.symbol.to_string()), None)
-        ).await
-    }
-
-    /// Gets financial statements and metrics.
-    ///
-    /// ## Returns
-    ///
-    /// A Financials instance for accessing financial data.
-    pub fn financial(&self) -> Financial {
-        Financial::new(self.symbol)
+    async fn get_cached_or_fetch<F: Future<Output = Result<Value, StockError>>>(
+        &self, 
+        key: &str,
+        fetch_fn: F,
+        ttl: Duration,
+    ) ->   Result<Value, StockError> 
+    where F: Future<Output = Result<Value, StockError>> {
+        let mut cache = self.cache.lock().await;
+        if let Some((value, instant)) = cache.get(key) {
+            if instant.elapsed() < Duration::from_secs(60) {
+                return Ok(value.clone());
+            } else {
+                cache.pop(key);// Expired
+            }
+        }
+        
+        // Fetch and cache the value
+        let result = fetch_fn.await;
+        match result {
+            Ok(value) => {
+                cache.put(key.to_string(), (value.clone(), Instant::now()));
+                Ok(value)
+            }
+            Err(e) => Err(StockError::FetchError(e.to_string())),
+        }
     }
 
-    /// Gets company rating information.
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
-    pub async fn rating(&self) -> Result<Value, reqwest::Error> {
-        make_request(
-            "company/rating",
-            generate_json(Value::String(self.symbol.to_string()), None)
-        ).await
+    pub async fn list(&self) -> Result<Value, StockError> {
+        let cache_key = format!("stock/list");
+        
+        let fetch_fn = async  {
+            make_request("stock/list", HashMap::new()).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch stock list: {}", e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
 
-    /// Gets real-time stock price.
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
-    pub async fn current_price(&self) -> Result<Value, reqwest::Error> {
-        make_request(
-            "stock/real-time-price",
-            generate_json(Value::String(self.symbol.to_string()), None)
-        ).await
+    pub async fn profile(&self, symbol: &str) -> Result<Value, StockError> {
+        let cache_key = format!("stock/{}", symbol);
+        
+        let fetch_fn = async  {
+            make_request(
+                "company/profile",
+                generate_json(Value::String(symbol.to_string()), None)
+            ).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch stock profile for {}: {}", symbol, e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
 
-    /// Gets historical price data.
-    ///
-    /// ## Arguments
-    ///
-    /// * `start_date` - Optional start date
-    /// * `end_date` - Optional end date
-    /// * `data_type` - Optional data type
-    /// * `limit` - Optional limit of data points
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
+    pub async fn quote(&self, symbol: &str) -> Result<Value, StockError> {
+        let cache_key = format!("quote/{}", symbol);
+        
+        let fetch_fn = async {
+            make_request(
+                "quote",
+                generate_json(Value::String(symbol.to_string()), None)
+            ).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch quote for {}: {}", symbol, e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
+    }
+
+    pub async fn financial(&self, symbol: &str) -> Result<Value, StockError> {
+        let cache_key = format!("financial/{}", symbol);
+        
+        let fetch_fn = async {
+            let financial_req = Financial::new(symbol);
+            let res_hash = financial_req.all().await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch financial data for {}: {}", symbol, e.to_string())))
+            .unwrap();
+
+        let result = to_value(res_hash)
+            .map_err(|e| StockError::ParseError(e.to_string()));
+        match result {
+            Ok(value) => Ok(value),
+            Err(e) => Err(StockError::ParseError(format!("Failed to parse financial data for {}: {}", symbol, e.to_string()))),
+        }
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
+    }
+
+    pub async fn rating(&self, symbol: &str) -> Result<Value, StockError> {
+        let cache_key = format!("rating/{}", symbol);
+        
+        let fetch_fn = async {
+            make_request(
+                "company/rating",
+                generate_json(Value::String(symbol.to_string()), None)
+            ).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch rating for {}: {}", symbol, e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
+    }
+
+    pub async fn current_price(&self, symbol: &str) -> Result<Value, StockError> {
+        let cache_key = format!("current_price/{}", symbol);
+        
+        let fetch_fn = async {
+            make_request(
+                "stock/real-time-price",
+                generate_json(Value::String(symbol.to_string()), None)
+            ).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch current price for {}: {}", symbol, e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
+    }
+
     pub async fn history(
         &self,
+        symbol: &str,
         start_date: Option<&str>,
         end_date: Option<&str>,
         data_type: Option<&str>,
         limit: Option<i32>,
-    ) -> Result<Value, reqwest::Error> {
-        let query_params = json!({
-            "from": start_date,
-            "to": end_date,
-            "serietype": data_type,
-            "timeseries": limit
-        });
+    ) -> Result<Value, StockError> {
+        let cache_key = format!("history/{}", symbol);
+        
+        let fetch_fn = async {
+            let query_params = json!({
+                "from": start_date,
+                "to": end_date,
+                "serietype": data_type,
+                "timeseries": limit
+            });
 
-        make_request(
-            "historical-price-full",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+            make_request(
+                "historical-price-full",
+                generate_json(Value::String(symbol.to_string()), Some(query_params))
+            ).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch history for {}: {}", symbol, e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
 
-    /// Gets dividend history.
-    ///
-    /// ## Arguments
-    ///
-    /// * `start_date` - Optional start date
-    /// * `end_date` - Optional end date
-    /// * `data_type` - Optional data type
-    /// * `limit` - Optional limit of data points
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn dividend_history(
         &self,
+        symbol: &str,
         start_date: Option<&str>,
         end_date: Option<&str>,
         data_type: Option<&str>,
         limit: Option<i32>,
-    ) -> Result<Value, reqwest::Error> {
-        let query_params = json!({
-            "from": start_date,
-            "to": end_date,
-            "serietype": data_type,
-            "timeseries": limit
-        });
+    ) -> Result<Value, StockError> {
+        let cache_key = format!("dividend_history/{}", symbol);
+        
+        let fetch_fn = async {
+            let query_params = json!({
+                "from": start_date,
+                "to": end_date,
+                "serietype": data_type,
+                "timeseries": limit
+            });
 
-        make_request(
-            "historical-price-full/stock_dividend",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+            make_request(
+                "historical-price-full/stock_dividend",
+                generate_json(Value::String(symbol.to_string()), Some(query_params))
+            ).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch dividend history for {}: {}", symbol, e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
 
-    /// Gets stock split history.
-    ///
-    /// ## Arguments
-    ///
-    /// * `start_date` - Optional start date
-    /// * `end_date` - Optional end date
-    /// * `data_type` - Optional data type
-    /// * `limit` - Optional limit of data points
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn split_history(
         &self,
+        symbol: &str,
         start_date: Option<&str>,
         end_date: Option<&str>,
         data_type: Option<&str>,
         limit: Option<i32>,
-    ) -> Result<Value, reqwest::Error> {
-        let query_params = json!({
-            "from": start_date,
-            "to": end_date,
-            "serietype": data_type,
-            "timeseries": limit
-        });
+    ) -> Result<Value, StockError> {
+        let cache_key = format!("split_history/{}", symbol);
+        
+        let fetch_fn = async {
+            let query_params = json!({
+                "from": start_date,
+                "to": end_date,
+                "serietype": data_type,
+                "timeseries": limit
+            });
 
-        make_request(
-            "historical-price-full/stock_split",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+            make_request(
+                "historical-price-full/stock_split",
+                generate_json(Value::String(symbol.to_string()), Some(query_params))
+            ).await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch split history for {}: {}", symbol, e.to_string())))
+        };
+        self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
-}
 
+    async fn validate_tickers(&self, tickers: Vec<String>) -> Result<Vec<String>, StockError> {
+        let valid_tickers = self.list().await?;
+        let valid_tickers = valid_tickers.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<HashSet<_>>();
+        let invalid_tickers = tickers.iter().filter(|t| !valid_tickers.contains(t.as_str())).collect::<Vec<_>>();
+        if !invalid_tickers.is_empty() {
+            return Err(StockError::VoidTickersError(format!("Invalid tickers: {:?}", invalid_tickers)));
+        }
+        Ok(tickers)
+    }
 
-pub async fn example() -> Result<(), reqwest::Error> {
-    let aapl = Stock::new("AAPL");
+    async fn retry<F, Fut, T, E>(
+        config: &RetryConfig,
+        mut operation: F,
+    ) -> Result<T, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let mut attempts = 0;
     
-    // Get company profile
-    let profile = aapl.profile().await?;
+        loop {
+            attempts += 1;
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(err) if attempts < config.max_attempts => {
+                    let delay = std::cmp::min(
+                        config.base_delay_ms * (2u64.pow(attempts - 1)),
+                        config.max_delay_ms,
+                    );
+                    sleep(Duration::from_millis(delay)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
     
-    // Get current quote
-    let quote = aapl.quote().await?;
+    async fn process_batch(
+        &self,
+        tickers: Vec<String>,
+        fetch_type: FetchType,
+    ) -> Result<Value, StockError> {
+        if tickers.is_empty() {
+            return Err(StockError::VoidTickersError(
+                "No tickers provided".to_string(),
+            ));
+        }
     
-    // Get financial data
-    let financials = aapl.financial();
-    let income = financials.income(None).await?;
+        let retry_config = RetryConfig::default();
+        let mut results = Vec::new();
     
-    // Get historical data
-    let history = aapl.history(
-        Some("2023-01-01"),
-        Some("2023-12-31"),
-        None,
-        Some(100)
-    ).await?;
+        for ticker in tickers {
+            let operation = || async {
+                match fetch_type {
+                    FetchType::Quote => self.quote(&ticker).await,
+                    FetchType::Financial => self.financial(&ticker).await,
+                    FetchType::Profile => self.profile(&ticker).await,
+                    FetchType::Rating => self.rating(&ticker).await,
+                    FetchType::CurrentPrice => self.current_price(&ticker).await,
+                    FetchType::History => self.history(&ticker, None, None, None, None).await,
+                    FetchType::DividendHistory => self.dividend_history(&ticker, None, None, None, None).await,
+                    FetchType::SplitHistory => self.split_history(&ticker, None, None, None, None).await,
+                    _ => unreachable!(),
+                }
+            };
     
-    Ok(())
+            let result = Self::retry(&retry_config, operation).await;
+    
+            match result {
+                Ok(value) => {
+                    counter!("stock.success").increment(1);
+                    results.push(value);
+                }
+                Err(e) => {
+                    error!("Failed to fetch data for {}: {:?}", ticker, e);
+                    counter!("stock.failures").increment(1);
+                    results.push(Value::Null);
+                }
+            }
+        }
+    
+        Ok(Value::Array(results))
+    }
+
+    pub async fn poll(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<(), StockError> {
+        let config = Arc::clone(&self.batch_config);
+
+        let tickers = self.validate_tickers(tickers).await?;
+
+        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
+        let mut futures= vec![];
+        for chunk in tickers.chunks(config.batch_size) {
+            let semaphore = Arc::clone(&semaphore);
+            let batch = chunk.to_vec();
+
+            let self_clone = Self::new();
+
+            let future = tokio::spawn({
+                async move {
+                    let _permit = semaphore.acquire().await.unwrap();
+                    self_clone.process_batch(batch, fetch_type).await
+                }
+                
+            });
+            futures.push(future);
+        }
+
+        for future in futures {
+            match future.await {
+                Ok(value) => {
+                    info!("Fetched data: {:?}", value);
+                }
+                Err(e) => {
+                    error!("Failed to fetch data: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }

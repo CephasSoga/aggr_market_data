@@ -7,12 +7,14 @@ use tracing::{info, error};
 use metrics::{counter, gauge};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub enum CommodityError {
     FetchError(String),
     TaskError(String),
     ParseError(String),
+    VoidTickersError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -127,26 +129,8 @@ impl CommodityPolling {
         Ok(())
     }
 
-/// Polls available commodities, processing them in batches with concurrency control.
-/// 
-/// ## Arguments
-///
-/// * `config` - Optional batch configuration for polling. If None, default configuration is used.
-///
-/// ## Returns
-///
-/// A Result indicating success or a `CommodityError`.
-///
-/// ## Behavior
-///
-/// The function retrieves a list of commodities, splits them into batches, and processes each batch asynchronously.
-/// A semaphore is used to limit concurrent processing. The function handles errors at different stages, including
-/// fetching the list of commodities, parsing them, and processing each batch. Errors are logged, and retries are
-/// attempted based on the provided configuration.
 
-    pub async fn poll(config: Option<BatchConfig>) -> Result<(), CommodityError> {
-        let config = config.unwrap_or_default();
-
+    async fn validate_tickers(tickers: Option<Vec<String>>) -> Result<Vec<String>, CommodityError> {
         let commodities = Self::list()
             .await
             .map_err(|e| CommodityError::FetchError(e.to_string()))?
@@ -157,7 +141,34 @@ impl CommodityPolling {
             .collect::<Result<Vec<Commodity>, _>>()
             .map_err(|e| CommodityError::ParseError(e.to_string()))?;
 
-        let symbols: Vec<String> = commodities.iter().map(|c| c.symbol.clone()).collect();
+        let available_symbols: HashSet<_> = commodities.iter().map(|c| c.symbol.clone()).collect();
+        match tickers {
+            Some(input_symbols) => {
+                let invalid_symbols: Vec<_> = input_symbols
+                    .iter()
+                    .filter(|s| !available_symbols.contains(*s))
+                    .cloned()
+                    .collect();
+                
+                if invalid_symbols.is_empty() {
+                    Ok(input_symbols)
+                } else {
+                    Err(CommodityError::ParseError(format!(
+                        "Invalid ticker symbols: {:?}",
+                        invalid_symbols
+                    )))
+                }
+            }
+            None => Err(CommodityError::VoidTickersError("No tickers provided".to_string())),
+        }
+    }
+
+    pub async fn poll(tickers: Option<Vec<String>>, config: Option<BatchConfig>) -> Result<(), CommodityError> {
+        let config = config.unwrap_or_default();
+
+        let symbols = Self::validate_tickers(tickers).await?;
+
+        info!("Polling {} available commodities", symbols.len());
         let semaphore = std::sync::Arc::new(Semaphore::new(config.concurrency_limit));
         let mut tasks = vec![];
 

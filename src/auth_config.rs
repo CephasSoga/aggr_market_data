@@ -3,7 +3,7 @@ use std::hash::Hash;
 
 use serde::Deserialize;
 use config::{builder::DefaultState, ConfigBuilder, ConfigError, File};
-
+use std::time::Duration;
 
 #[derive(Debug, Clone, Hash, Deserialize)]
 pub struct ConfigHeader {
@@ -18,7 +18,12 @@ pub struct AuthConfig {
 
 #[derive(Debug, Clone, Hash, Deserialize)]
 pub struct WebsocketConfig {
-    
+    pub concurrency_limit: usize,
+    pub batch_size: usize,
+    pub retry_attempts: u32,
+    pub backoff_ms: u64,
+    pub rate_limit_per_second: u32,
+    pub cache_ttl: u32,
 }
 
 #[derive(Clone, Hash, Debug, Deserialize)]
@@ -58,5 +63,29 @@ impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Format the fields of ValueConfig as needed
         write!(f, "{}", self.header.msg)
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct BatchConfig {
+    pub concurrency_limit: usize,
+    pub batch_size: usize,
+    pub retry_attempts: u32,
+    pub backoff_ms: u64,
+    pub rate_limit_per_second: u32,
+    pub cache_ttl: Duration,
+}
+impl Default for BatchConfig {
+    fn default() -> Self {
+        let config = Config::new().unwrap();
+        Self {
+            concurrency_limit: config.websocket.concurrency_limit,
+            batch_size: config.websocket.batch_size,
+            retry_attempts: config.websocket.retry_attempts,
+            backoff_ms: config.websocket.backoff_ms,
+            rate_limit_per_second: config.websocket.rate_limit_per_second,
+            cache_ttl: Duration::from_secs(config.websocket.cache_ttl as u64),
+        }
     }
 }

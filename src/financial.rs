@@ -2,6 +2,8 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
+use std::collections::HashMap;
+
 use crate::request::{make_request, generate_json};
 use serde_json::{json, Value};
 
@@ -11,24 +13,10 @@ pub struct Financial<'a> {
 }
 
 impl<'a> Financial<'a> {
-    /// Creates a new Financials instance for a specific stock symbol.
-    ///
-    /// ## Arguments
-    ///
-    /// * `symbol` - The stock symbol to get financial data for
     pub fn new(symbol: &'a str) -> Self {
         Self { symbol }
     }
 
-    /// Gets income statement data.
-    ///
-    /// ## Arguments
-    ///
-    /// * `period` - The period for the data (defaults to "annual")
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn income(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
@@ -40,15 +28,6 @@ impl<'a> Financial<'a> {
         ).await
     }
 
-    /// Gets balance sheet data.
-    ///
-    /// ## Arguments
-    ///
-    /// * `period` - The period for the data (defaults to "annual")
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn balance(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
@@ -60,15 +39,6 @@ impl<'a> Financial<'a> {
         ).await
     }
 
-    /// Gets cash flow statement data.
-    ///
-    /// ## Arguments
-    ///
-    /// * `period` - The period for the data (defaults to "annual")
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn cashflow(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
@@ -80,15 +50,6 @@ impl<'a> Financial<'a> {
         ).await
     }
 
-    /// Gets key company metrics.
-    ///
-    /// ## Arguments
-    ///
-    /// * `period` - The period for the data (defaults to "annual")
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn metrics(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
@@ -100,15 +61,6 @@ impl<'a> Financial<'a> {
         ).await
     }
 
-    /// Gets financial statement growth data.
-    ///
-    /// ## Arguments
-    ///
-    /// * `period` - The period for the data (defaults to "annual")
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn growth(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
@@ -120,15 +72,6 @@ impl<'a> Financial<'a> {
         ).await
     }
 
-    /// Gets company enterprise value data.
-    ///
-    /// ## Arguments
-    ///
-    /// * `period` - The period for the data (defaults to "annual")
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn company_value(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
@@ -140,16 +83,33 @@ impl<'a> Financial<'a> {
         ).await
     }
 
-    /// Gets financial ratios.
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn ratios(&self) -> Result<Value, reqwest::Error> {
         make_request(
             "financial-ratios",
             generate_json(Value::String(self.symbol.to_string()), None)
         ).await
+    }
+
+    pub async fn dcf(&self) -> Result<Value, reqwest::Error> {
+        make_request(
+            "discounted-cash-flow",
+            generate_json(Value::String(self.symbol.to_string()), None)
+        ).await
+    }
+
+    pub async fn all(&self) -> Result<HashMap<String, Value>, reqwest::Error> {
+        let mut data = HashMap::new();
+
+        data.insert("income".to_string(), self.income(None).await?);
+        data.insert("balance".to_string(), self.balance(None).await?);
+        data.insert("cashflow".to_string(), self.cashflow(None).await?);
+        data.insert("metrics".to_string(), self.metrics(None).await?);
+        data.insert("growth".to_string(), self.growth(None).await?);
+        data.insert("company_value".to_string(), self.company_value(None).await?);
+        data.insert("ratios".to_string(), self.ratios().await?);
+        data.insert("dcf".to_string(), self.dcf().await?);
+
+        Ok(data)
     }
 }
 

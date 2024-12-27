@@ -5,3 +5,9 @@ msg = "Socket started."
 token = "GRS0D5vK0ymAcBFsKt2KVwLoKott970G"
 
 [websocket]
+concurrency_limit = 100
+batch_size = 1024
+retry_attempts = 3
+backoff_ms = 5
+rate_limit_per_second = 100
+cache_ttl = 600
