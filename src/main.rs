@@ -11,7 +11,6 @@ pub mod request;
 pub mod search;
 pub mod stock;
 pub mod websocket;
-pub mod polling;
 
 fn main() {
     println!("Hello, world!");

@@ -23,7 +23,7 @@ use lru::LruCache;
 use tokio::sync::Mutex;
 use thiserror::Error;
 
-use crate::auth_config::BatchConfig;
+use crate::auth_config::{RetryConfig, BatchConfig};
 
 #[derive(Debug, Clone)]
 pub enum FetchType {
@@ -57,39 +57,23 @@ pub enum ForexError {
     VoidTickersError(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    pub max_attempts: u32,
-    pub base_delay_ms: u64,
-    pub max_delay_ms: u64,
-    pub rate_limit_per_second: u32,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            base_delay_ms: 1000,
-            max_delay_ms: 10000,
-            rate_limit_per_second: 50,
-        }
-    }
-}
-
 /// Functions for accessing foreign exchange rate data from the FMP API.
 pub struct ForexPolling {
     cache: Arc<Mutex<LruCache<String, (Value, Instant)>>>,
-    retry_config: RetryConfig,
-    semaphore: Arc<Semaphore>,
+    retry_config: Arc<RetryConfig>, //RetryConfig,
+    batch_config: Arc<BatchConfig>,
+    semaphore: Arc<Mutex<Semaphore>>,
 }
 
 impl ForexPolling {
     pub fn new() -> Self {
-        let retry_config = RetryConfig::default();
+        let retry_config = Arc::new(RetryConfig::default());
+        let batch_config = Arc::new(BatchConfig::default());
         Self { 
             cache: Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))),
-            retry_config: retry_config.clone(),
-            semaphore: Arc::new(Semaphore::new(retry_config.rate_limit_per_second as usize)),
+            retry_config: Arc::clone(&retry_config),
+            batch_config: Arc::clone(&batch_config),
+            semaphore: Arc::new(Mutex::new(Semaphore::new(retry_config.rate_limit_per_second as usize))),
         }
     }
 
@@ -230,38 +214,96 @@ impl ForexPolling {
             .into_iter()
             .map(|ticker| (ticker[..3].to_string(), ticker[3..].to_string()))
             .collect::<Vec<_>>();
-        let semaphore = self.semaphore.clone();
-        let retry_config = self.retry_config.clone();
+
+        let concurrrency_limit = self.retry_config.concurrency_limit;
+
+        let start = Instant::now();
+        let mut tasks = Vec::new();
+
+        //Shared self
+        let shared_self = Arc::new(Self::new());
     
-        let mut results = Vec::new();
+        
         for ticker in tickers {
-            let result = Self::retry(&retry_config, {
-                let semaphore = Arc::clone(&semaphore);
-                let fetch_type = fetch_type.clone();
-                let self_ref = self.clone(); // Ensure `self` is cloned properly
-    
-                move || async move {
-                    let _permit = &semaphore.acquire().await.unwrap();
+            let retry_config = Arc::clone(&self.retry_config);
+            let fetch_type = fetch_type.clone();
+            let ticker = ticker.clone();
+            let semaphore = self.semaphore.clone();
+
+            let self_ref = Arc::clone(&shared_self);
+            
+            let task = tokio::spawn(async move {
+                let bind = Arc::clone(&semaphore);
+                let semaphore = bind.lock().await;
+                let permit = &semaphore.acquire().await.unwrap();
+                let operation = || async {
                     match fetch_type {
                         FetchType::List => self_ref.list().await,
                         FetchType::Rate => self_ref.rate((&ticker.0, &ticker.1)).await,
                         FetchType::Historical => {
                             self_ref.history((&ticker.0, &ticker.1), None, None, None, None).await
                         }
+                        _ => unreachable!(),
                     }
+                };
+
+                let result = Self::retry(&retry_config, operation).await;
+
+                // Drop the semaphore permit
+                drop(permit);
+
+                match result {
+                    Ok(value) => {
+                        counter!("forex.success").increment(1);
+                        value
+                    },
+                    Err(e) => {
+                        error!("Failed to fetch data for {}: {:?}{:?}", ticker.0, ticker.1, e);
+                        counter!("forex.failures").increment(1);
+                        Value::Null
+                    },
                 }
-            }).await;
-    
-            match result {
-                Ok(value) => results.push(value),
-                Err(e) => {
-                    error!("Failed to fetch data for {}: {:?}{:?}", ticker.0, ticker.1, e);
-                    counter!("stock.failures").increment(1);
-                    results.push(Value::Null);
-                }
-            }
+                    
+            });
+            tasks.push(task);
+
         }
     
-        Ok(Value::Array(results))
+        let results = futures::future::join_all(tasks).await;
+        let mut values = Vec::new();
+        for result in results {
+            values.push(result.unwrap());
+        }
+
+        let elapsed = start.elapsed();
+        gauge!("forex.batch_duration", "rate limit" => format!("{}", elapsed.as_secs_f64()));
+        
+        Ok(Value::Array(values))
+    }
+
+    pub async fn poll(&self, tickers: Vec<(String, String)>, fetch_type: FetchType) -> Result<(), ForexError> {
+        let config = Arc::clone(&self.batch_config);
+        
+        let mut futures = vec![];
+
+        for chunk in tickers.chunks(config.batch_size) {
+            let chunk = chunk.to_vec();
+            let fetch_type = fetch_type.clone();
+            let self_ref = Self::new();
+            let future = tokio::spawn(async move {
+                self_ref.process_batch(chunk, fetch_type).await
+            });
+            futures.push(future);
+        }
+
+        for future in futures {
+            match future.await {
+                Ok(value) => info!("Task completed successfully: {:?}", value),
+                Err(e) => error!("Task encountered an error: {:?}", e),
+                
+            }
+        }
+
+        Ok(())
     }    
 }

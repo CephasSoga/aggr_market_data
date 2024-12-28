@@ -46,11 +46,12 @@ impl ServerSocket {
     async fn handle_connection(stream: tokio::net::TcpStream, mut tx: mpsc::Sender<String>) {
         let ws_stream = accept_async(stream).await.unwrap();
         let (mut write, mut read) = ws_stream.split();
+        let write_clone = write.clone();
 
         let (data_tx, mut data_rx) = mpsc::channel(100);
         tokio::spawn(async move {
             while let Some(data) = data_rx.recv().await {
-                write.send(Message::Text(data)).await.unwrap();
+                &write.send(Message::Text(data)).await.unwrap();
             }
         });
 
@@ -65,7 +66,7 @@ impl ServerSocket {
                     println!("Received text message: {}", text);
                     let response = format!("Echo: {}", text);
                     // Sending a response to the received text message
-                    write.send(Message::Text(response)).await.unwrap();
+                    &write.send(Message::Text(response)).await.unwrap();
                 }
                 Ok(Message::Binary(bin)) => {
                     // Handle binary message

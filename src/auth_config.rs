@@ -89,3 +89,25 @@ impl Default for BatchConfig {
         }
     }
 }
+
+
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub rate_limit_per_second: u32,
+    pub concurrency_limit: usize,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 1000,
+            max_delay_ms: 10000,
+            rate_limit_per_second: 50,
+            concurrency_limit: 10,
+        }
+    }
+}

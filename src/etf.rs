@@ -80,23 +80,3 @@ impl Etf {
         ).await
     }
 }
-
-
-pub async fn example() -> Result<(), reqwest::Error> {
-    // List all ETFs
-    let etfs = Etf::list().await?;
-    
-    // Get quote for a specific ETF
-    let spy_quote = Etf::quote(Some("SPY")).await?;
-    
-    // Get historical data
-    let history = Etf::history(
-        "SPY",
-        Some("2023-01-01"),
-        Some("2023-12-31"),
-        None,
-        Some(100)
-    ).await?;
-    
-    Ok(())
-}

@@ -9,27 +9,6 @@ use serde_json::{json, Value};
 pub struct Search;
 
 impl Search {
-    /// Searches for financial instruments based on keywords.
-    ///
-    /// ## Arguments
-    ///
-    /// * `keywords` - Search terms to find matching instruments
-    /// * `limit` - Optional maximum number of results to return
-    /// * `exchange` - Optional exchange to filter results by
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// // Search for "apple" with max 10 results from NASDAQ
-    /// let results = Search::query("apple", Some(10), Some("NASDAQ")).await?;
-    ///
-    /// // Search for "tesla" with no limits
-    /// let results = Search::query("tesla", None, None).await?;
-    /// ```
     pub async fn query(
         keywords: &str,
         limit: Option<i32>,
@@ -50,10 +29,8 @@ impl Search {
 
 
 pub async fn example() -> Result<(), reqwest::Error> {
-    // Search for "apple" with max 10 results from NASDAQ
     let results = Search::query("apple", Some(10), Some("NASDAQ")).await?;
-    
-    // Search for "tesla" with no limits
+
     let all_results = Search::query("tesla", None, None).await?;
     
     Ok(())
