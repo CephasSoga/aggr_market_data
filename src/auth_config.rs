@@ -111,3 +111,18 @@ impl Default for RetryConfig {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct TimeConfig {
+    pub ms_back: u64,
+    pub days_back: u64,
+}
+impl Default for TimeConfig {
+    fn default() -> Self {
+        Self {
+            ms_back: 1000,
+            days_back: 1,
+        }
+    }
+    
+}

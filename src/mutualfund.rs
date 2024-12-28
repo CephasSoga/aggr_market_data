@@ -10,24 +10,10 @@ use std::collections::HashMap;
 pub struct MutualFund;
 
 impl MutualFund {
-    /// Lists all available mutual funds.
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn list() -> Result<Value, reqwest::Error> {
         make_request("symbol/available-mutual-funds", HashMap::new()).await
     }
 
-    /// Gets quotes for either a specific mutual fund or all mutual funds.
-    ///
-    /// ## Arguments
-    ///
-    /// * `symbol` - Optional mutual fund symbol to get quote for. If None, returns quotes for all mutual funds.
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn quote(symbol: Option<&str>) -> Result<Value, reqwest::Error> {
         match symbol {
             Some(s) => make_request("quote", generate_json(Value::String(s.to_string()), None)).await,
@@ -35,19 +21,6 @@ impl MutualFund {
         }
     }
 
-    /// Gets historical price data for a mutual fund.
-    ///
-    /// ## Arguments
-    ///
-    /// * `symbol` - Mutual fund symbol to get history for
-    /// * `start_date` - Optional start date
-    /// * `end_date` - Optional end date
-    /// * `data_type` - Optional data type
-    /// * `limit` - Optional limit of data points
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn history(
         symbol: &str,
         start_date: Option<&str>,
@@ -68,19 +41,6 @@ impl MutualFund {
         ).await
     }
 
-    /// Gets dividend history for a mutual fund.
-    ///
-    /// ## Arguments
-    ///
-    /// * `symbol` - Mutual fund symbol to get dividend history for
-    /// * `start_date` - Optional start date
-    /// * `end_date` - Optional end date
-    /// * `data_type` - Optional data type
-    /// * `limit` - Optional limit of data points
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn dividend_history(
         symbol: &str,
         start_date: Option<&str>,
@@ -101,19 +61,6 @@ impl MutualFund {
         ).await
     }
 
-    /// Gets split history for a mutual fund.
-    ///
-    /// ## Arguments
-    ///
-    /// * `symbol` - Mutual fund symbol to get split history for
-    /// * `start_date` - Optional start date
-    /// * `end_date` - Optional end date
-    /// * `data_type` - Optional data type
-    /// * `limit` - Optional limit of data points
-    ///
-    /// ## Returns
-    ///
-    /// A Result containing either the JSON response or an error.
     pub async fn split_history(
         symbol: &str,
         start_date: Option<&str>,
@@ -136,21 +83,3 @@ impl MutualFund {
 }
 
 
-pub async fn example() -> Result<(), reqwest::Error> {
-    // List all mutual funds
-    let funds = MutualFund::list().await?;
-    
-    // Get quote for a specific fund
-    let vanguard_quote = MutualFund::quote(Some("VFINX")).await?;
-    
-    // Get historical data
-    let history = MutualFund::history(
-        "VFINX",
-        Some("2023-01-01"),
-        Some("2023-12-31"),
-        None,
-        Some(100)
-    ).await?;
-    
-    Ok(())
-}
