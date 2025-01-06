@@ -7,10 +7,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use crate::auth_config::Config;
 
-/// The base URL for the Financial Modeling Prep API.
+/// The base api/v3 URL for the Financial Modeling Prep API.
 const BASE_URL: &str = "https://financialmodelingprep.com/api/v3/";
 
-/// Creates the endpoint using the default base URL and adding the respective
+/// Creates the api/v3 endpoint using the default base URL and adding the respective
 /// path and query parameters to be requested by the API.
 ///
 /// Future Use: In case of querying a new database in the future, this is the
@@ -85,7 +85,7 @@ pub fn generate_json(path_param: Value, query_param: Option<Value>) -> HashMap<S
     params
 }
 
-/// Makes a GET request to the specified path with the given parameters.
+/// Makes a GET request to the specified api/v3 path with the given parameters.
 ///
 /// ## Arguments
 ///
@@ -101,6 +101,70 @@ pub async fn make_request(path: &str, params: HashMap<String, Value>) -> Result<
 
     let config = Config::new().expect("Could not read Configurations.");
     let url = url(&request_params, config);
+
+    let client = reqwest::Client::new();
+    let response = client.get(&url).send().await?;
+    response.json::<Value>().await
+}
+
+
+/// The base api/v4 URL for the Financial Modeling Prep API.
+const BASE_URL_2: &str = "https://financialmodelingprep.com/api/v4/";
+
+
+/// Creates the api/v4 endpoint using the default base URL and adding the respective
+/// path and query parameters to be requested by the API.
+fn url_2(params: &HashMap<String, Value>, config: Config) -> String {
+    let query_parameters = params.get("query").and_then(|v| v.as_object());
+    let path_parameters = params.get("path");
+    let url_path = params.get("urlPath").and_then(|v| v.as_str()).unwrap_or("");
+    let mut url = String::from(BASE_URL);
+    let mut query_string = String::new();
+    let apikey = config.auth.token;
+
+    url.push_str(url_path);
+
+    if let Some(path_params) = path_parameters {
+        let path_str = match path_params {
+            Value::Array(arr) => arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+            _ => path_params.to_string(),
+        };
+        url.push('/');
+        url.push_str(&path_str.to_uppercase());
+    }
+
+    if let Some(query_params) = query_parameters {
+        for (key, value) in query_params {
+            if !value.is_null() {
+                query_string.push_str(&format!("{}={}&", key, value));
+            }
+        }
+        if !query_string.is_empty() {
+            query_string.pop(); // Remove trailing '&'
+            url.push('?');
+            url.push_str(&query_string);
+        }
+    }
+
+    if query_string.is_empty() {
+        url.push('?');
+    } else {
+        url.push('&');
+    }
+
+    url.push_str(&format!("apikey={}", apikey));
+
+    url
+}
+
+
+/// Makes a GET request to the specified api/v4 path with the given parameters.
+pub async fn make_request_2(path: &str, params: HashMap<String, Value>) -> Result<Value, reqwest::Error> {
+    let mut request_params = params;
+    request_params.insert("urlPath".to_string(), Value::String(path.to_string()));
+
+    let config = Config::new().expect("Could not read Configurations.");
+    let url = url_2(&request_params, config);
 
     let client = reqwest::Client::new();
     let response = client.get(&url).send().await?;
