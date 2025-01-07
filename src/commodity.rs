@@ -114,7 +114,8 @@ impl CommodityPolling {
             }
         }
 
-        gauge!("commodity.batch_duration", "rate limit" => format!("{}", start.elapsed().as_secs_f64()));
+        let gauge = gauge!("commodity.batch_duration", "rate limit" => format!("{}", start.elapsed().as_secs_f64()));
+        gauge.decrement(1);
         Ok(())
     }
 

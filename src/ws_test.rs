@@ -31,8 +31,17 @@ impl ServerSocket {
             Error::Url(tungstenite::error::UrlError::NoHostName)
         })?;
 
+        println!("Resolved to IP address: {}", addr);
+
+        // Extract IP and Port separately
+        let ip_only = addr.ip();
+        let port = addr.port();
+        let bind_addr = format!("{}:{}", ip_only, port);
+
+        println!("Binding to: {}", bind_addr);
+
         println!("Setting address: {}", self.address);
-        let listener = TcpListener::bind(&addr).await
+        let listener = TcpListener::bind(&bind_addr).await
             .map_err(|e| println!("Error: {}", e.to_string()))
             .unwrap();
         println!("WebSocket server listening on: {}", self.address);
@@ -92,6 +101,6 @@ impl ServerSocket {
 }
 
 pub async fn main_() -> Result<(), Error> {
-    let server = ServerSocket::new("0.0.0.0:8080");
+    let server = ServerSocket::new("127.0.0.1:8080");
     server.run().await
 }
