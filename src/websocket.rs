@@ -1,4 +1,4 @@
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, Future};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 //use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -7,7 +7,28 @@ use async_tungstenite::tungstenite::protocol::Message;
 use async_tungstenite::tungstenite::error::Error;
 use tungstenite::protocol::WebSocketConfig;
 use tokio::net::lookup_host;
+use serde_json::{to_value, Value};
+use serde::{Serialize, Deserialize};
+use crate::auth_config::BatchConfig;
+use crate::cache::SharedLockedCache;
+use crate::request_parser::parser::CallParser;
+use crate::request_parser::params::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::pin::Pin;
 
+
+use crate::stock::StockPolling;
+//use crate::crypto::CryptoPolling;
+//use crate::forex::ForexPolling;
+//use crate::economic_data::EconomicDataPolling;
+//use crate::technical_indicators::TechnicalIndicatorPolling;
+//use crate::market::MarketPolling;
+
+const REQUEST_SUCCUESS: u32 = 200;
+const REQUEST_FAILED: u32 = 400;
+const CACHE_SIZE: usize = 1000;
 
 pub struct ServerSocket {
     address: String,
@@ -74,8 +95,19 @@ impl ServerSocket {
             match msg {
                 Ok(Message::Text(text)) => {
                     println!("Received: {}", text);
-                    if let Err(_) = tx.send(format!("Echo: {}", text)).await {
-                        break;
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(json) => {
+                            println!("Parsed JSON: {:?}", json);
+                            if let Err(_) = tx.send(format!("Echo: {}", json)).await {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            println!("Failed to parse JSON: {}", e);
+                            if let Err(_) = tx.send("Invalid JSON".to_string()).await {
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok(Message::Close(_)) => break,
@@ -90,6 +122,161 @@ impl ServerSocket {
         write_task.abort();
     }
 }
+
+pub struct PollState {
+    cache: Arc<Mutex<SharedLockedCache>>,
+    batch_config: Arc<BatchConfig>,
+}
+impl Default for PollState{
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(SharedLockedCache::new(CACHE_SIZE))),
+            batch_config: Arc::new(BatchConfig::default()),
+        }
+    }
+}
+struct Collection;
+impl Collection {
+    async fn stock_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> String{
+        let stock_polling = StockPolling::new(state.cache.clone(), state.batch_config.clone());
+        stock_polling
+            .poll(&args)
+            .await
+            .map(|_| "Stock polling successful".to_string())
+            .unwrap_or_else(|e| format!("Stock polling failed: {}", e))
+        
+    }
+
+    fn stock_polling_func(state: Arc<PollState>, args: Arc<Value>) -> Pin<Box<dyn Future<Output = String> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::stock_polling_unpinned(state, args).await
+        })
+    }
+    
+}
+
+
+type Func = fn(Arc<PollState>, Arc<Value>) -> Pin<Box<dyn Future<Output = String> + Send + 'static>>;
+pub struct MakeResponse{
+    fn_map: HashMap<String, Box<Func>>,
+}
+impl MakeResponse {
+    pub fn new() -> Self {
+        Self {
+            fn_map: HashMap::new(),
+        }
+    }
+
+    fn register_function(&mut self, where_: String, func: Func) {
+        self.fn_map.insert(where_, Box::new(func));
+    }
+
+    pub fn build(&mut self){
+        self.register_function("stock_polling".to_string(), Collection::stock_polling_func);
+    }
+
+    pub async fn make(&self, state: Arc<PollState>, s: &str) -> String {
+        let call_request: CallRequest = CallParser::key_lookup_parse_json(s).unwrap();
+        if call_request.target.to_str() == "task" {
+           match call_request.args {
+               Args::TaskArgs(task_args) => {
+                   let function = task_args.function;
+                   let args = task_args.params;
+                   if args.is_none() {
+                       return "Error: The argument hashmap is empty.".to_string();
+                   }
+                   let where_ = task_args.look_for.where_;
+                   match function {
+                       TaskFunction::AggregatedPolling => {
+                            let func = self.map_func(&where_).unwrap();
+                            let state  = Arc::clone(&state);
+                            let args= Arc::new(to_value(args.unwrap().clone()).unwrap());
+                            let message = self.exec_func(&func, state, args)
+                                .await
+                                .map_err(|e| self.return_error(e.to_string()));
+                            let status = REQUEST_SUCCUESS;
+                            let response = ServerResponse::new(status, Some(message.unwrap().clone()));
+                            return response.to_json();
+                       }
+                       _ => {}
+                   }
+               }
+               _ => {}
+           }
+        }
+        ServerResponse::new(REQUEST_SUCCUESS, Some(s.to_string())).to_json()
+    }
+
+    pub async fn make_(&self, state: Arc<PollState>, s: &str) -> String {
+        let call_request = match CallParser::key_lookup_parse_json(s) {
+            Ok(req) => req,
+            Err(_) => return ServerResponse::new(REQUEST_FAILED, Some("Invalid request".into())).to_json(),
+        };
+    
+        if call_request.target.to_str() == "task" {
+            if let Args::TaskArgs(task_args) = call_request.args {
+                return self.handle_task(state, task_args).await;
+            }
+        }
+    
+        ServerResponse::new(REQUEST_SUCCUESS, Some(s.to_string())).to_json()
+    }
+    
+    async fn handle_task(&self, state: Arc<PollState>, task_args: TaskArgs) -> String {
+        let where_ = task_args.look_for.where_;
+        if let Some(args) = task_args.params {
+            if let Some(func) = self.map_func(&where_) {
+                let args = Arc::new(to_value(args).unwrap());
+                let result = func(state, args).await;
+                return ServerResponse::new(REQUEST_SUCCUESS, Some(result)).to_json();
+            }
+        }
+    
+        ServerResponse::new(REQUEST_FAILED, Some("Function not found or invalid arguments".to_string())).to_json()
+    }
+    
+    fn map_func(&self, where_: &String) -> Option<Box<Func>> {
+        if let Some(func) = self.fn_map.get(where_) {
+            Some(func.clone())
+        } else {
+            None
+        }
+    }
+
+    async fn exec_func(&self, func: &Func, state: Arc<PollState>, args: Arc<Value>) -> Result<String, Error> {
+        let result = func(state, args).await;
+        Ok(result)
+    }
+
+    fn return_error(&self, msg: String) -> ServerResponse {
+        let status = REQUEST_FAILED;
+        ServerResponse::new(status, Some(msg.to_string()))
+
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerResponse {
+    pub status: u32,
+    pub message: Option<String>,
+}
+impl ServerResponse {
+    pub fn new(status: u32, message: Option<String>) -> Self {
+        Self {
+            status,
+            message,
+        }
+    }
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+    
+}
+
+
+
+
 
 pub async fn main_() -> Result<(), Error> {
     let server = ServerSocket::new("0.0.0.0:8080");

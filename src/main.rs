@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod auth_config;
 pub mod commodity;
 pub mod crypto;
@@ -14,6 +15,7 @@ pub mod technical_indicators;
 pub mod economic_data;
 pub mod websocket;
 pub mod utils;
+pub mod request_parser;
 
 use tokio;
 

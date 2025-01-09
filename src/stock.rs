@@ -21,9 +21,15 @@ use std::fmt::Display;
 use lru::LruCache;
 use tokio::sync::Mutex;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 use crate::auth_config::{RetryConfig, BatchConfig};
+use crate::cache::{Cache, SharedCache, SharedLockedCache};
 
+
+pub trait FunctionArgs {
+    fn expected_args() -> Vec<&'static str>;
+}
 
 #[derive(Clone, Copy)]
 pub enum FetchType {
@@ -35,6 +41,21 @@ pub enum FetchType {
     History,
     DividendHistory,
     SplitHistory,
+}
+impl FetchType {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "quote" => FetchType::Quote,
+            "financial" => FetchType::Financial,
+            "profile" => FetchType::Profile,
+            "rating" => FetchType::Rating,
+            "current_price" => FetchType::CurrentPrice,
+            "history" => FetchType::History,
+            "dividend_history" => FetchType::DividendHistory,
+            "split_history" => FetchType::SplitHistory,
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -63,15 +84,15 @@ pub enum StockError {
 
 /// Functions for accessing stock-related data from the FMP API.
 pub struct StockPolling {
-   cache: Arc<Mutex<LruCache<String, (Value, Instant)>>>,
+   cache: Arc<Mutex<SharedLockedCache>>,
    batch_config: Arc<BatchConfig>,
 }
 
 impl StockPolling {
-    pub fn new() -> Self {
+    pub fn new(cache: Arc<Mutex<SharedLockedCache>>, batch_config:Arc<BatchConfig>) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))),
-            batch_config: Arc::new(BatchConfig::default()),
+            cache,
+            batch_config,
         }
     }
 
@@ -83,7 +104,7 @@ impl StockPolling {
     ) ->   Result<Value, StockError> 
     where F: Future<Output = Result<Value, StockError>> {
         let mut cache = self.cache.lock().await;
-        if let Some((value, instant)) = cache.get(key) {
+        if let Some((value, instant)) = cache.get(key).await {
             if instant.elapsed() < Duration::from_secs(60) {
                 return Ok(value.clone());
             } else {
@@ -319,8 +340,11 @@ impl StockPolling {
         let start = Instant::now();
         let mut tasks = Vec::new();
 
+        let cache_clone = Arc::clone(&self.cache);
+        let config_clone = Arc::clone(&self.batch_config);
+
         // Shared self
-        let shared_self = Arc::new(Self::new());
+        let shared_self = Arc::new(Self::new(cache_clone, config_clone));
     
         for ticker in tickers {
             let permit = semaphore.clone().acquire_owned().await.unwrap(); // Acquire semaphore permit
@@ -380,9 +404,15 @@ impl StockPolling {
         gauge!("stock.batch_time", "rate limit" => format!("{}", elapsed.as_secs_f64()));
     
         Ok(Value::Array(results))
+    }
+
+    async fn foward_value(&self, value: Value) -> Result<i32, StockError> {
+        todo!("Foward value to client or anoter service"); 
+        let status = 1;
+        Ok(status)
     }    
 
-    pub async fn poll(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<(), StockError> {
+    async fn poll_(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<(), StockError> {
         let config = Arc::clone(&self.batch_config);
 
         let tickers = self.validate_tickers(tickers).await?;
@@ -393,12 +423,15 @@ impl StockPolling {
             let semaphore = Arc::clone(&semaphore);
             let batch = chunk.to_vec();
 
-            let self_clone = Self::new();
+            let cache_clone = Arc::clone(&self.cache);
+
+            let self_clone = Self::new(cache_clone, config.clone());
 
             let future = tokio::spawn({
                 async move {
                     let _permit = semaphore.acquire().await.unwrap();
-                    self_clone.process_batch(batch, fetch_type).await
+                    let value= self_clone.process_batch(batch, fetch_type).await?;
+                    self_clone.foward_value(value).await
                 }
                 
             });
@@ -417,5 +450,28 @@ impl StockPolling {
         }
 
         Ok(())
+    }
+    pub async fn poll(&self, value: &Value) -> Result<(), StockError> {
+        let tickers = value.get("tickers")
+        .and_then(Value::as_array)
+        .ok_or(StockError::ParseError("Missing 'tickers' field".to_string()))?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect::<Vec<String>>();
+
+    let fetch_type_str = value.get("fetch_type")
+        .and_then(Value::as_str)
+        .ok_or(StockError::ParseError("Missing 'fetch_type' field".to_string()))?;
+
+    let fetch_type = FetchType::from_str(fetch_type_str);
+    
+    self.poll_(tickers, fetch_type).await
+    }
+}
+
+impl FunctionArgs for fn(Value) -> Result<(), StockError> {
+    fn expected_args() -> Vec<&'static str> {
+        vec!["tickers", "fetch_type"]
     }
 }
