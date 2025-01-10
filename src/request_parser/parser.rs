@@ -56,28 +56,34 @@ impl CallParser {
                 let pwd = db_args.get("pwd").and_then(Value::as_str).map(String::from);
                 let document = db_args.get("document").and_then(Value::as_object).map(|doc| doc.clone().into_iter().collect());
 
-                Ok(Args::DatabaseArgs(DatabaseArgs {
-                    function,
-                    count,
-                    uri,
-                    user,
-                    pwd,
-                    document,
-                }))
+                Ok(Args {
+                    for_database: Some(DatabaseArgs {
+                        function,
+                        count,
+                        uri,
+                        user,
+                        pwd,
+                        document,
+                    }),
+                    for_task: None,
+                })
             }
             TargetService::Task => {
                 let task_args = json_value.get("args").ok_or("Missing 'args' field")?;
                 let function = task_args.get("function").and_then(Value::as_str).map(TaskFunction::from_str).ok_or("Missing 'function' field")?;
                 let count = task_args.get("count").and_then(Value::as_str).map(TaskCount::from_str).ok_or("Missing 'count' field")?;
-                let look_for = task_args.get("look_for").and_then(Value::as_str).map(LookFor::from_str).ok_or("Missing 'look_for' field")?;
+                let look_for = task_args.get("look_for").ok_or("Missing 'look_for' field".to_string()).and_then(|v| serde_json::from_value(v.clone()).map_err(|e| format!("Invalid 'look_for' field: {}", e)))?;
                 let params = task_args.get("params").and_then(Value::as_object).map(|p| p.clone().into_iter().collect());
 
-                Ok(Args::TaskArgs(TaskArgs {
-                    function,
-                    count,
-                    look_for,
-                    params,
-                }))
+                Ok(Args {
+                    for_database: None,
+                    for_task: Some(TaskArgs {
+                        function,
+                        count,
+                        look_for,
+                        params,
+                    }),
+                })
             }
             TargetService::Unknown => Err("Unknown target service".to_string()),
         }

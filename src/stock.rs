@@ -80,6 +80,12 @@ pub enum StockError {
     
     #[error("No tickers provided: {0}")]
     VoidTickersError(String),
+
+    #[error("Invalid ticker: {0}")]
+    InvalidTicker(String),
+
+    #[error("Too many tickers: {0}")]
+    TooManyTickersError(String),
 }
 
 /// Functions for accessing stock-related data from the FMP API.
@@ -138,7 +144,7 @@ impl StockPolling {
         
         let fetch_fn = async  {
             make_request(
-                "company/profile",
+                "profile",
                 generate_json(Value::String(symbol.to_string()), None)
             ).await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch stock profile for {}: {}", symbol, e.to_string())))
@@ -286,11 +292,23 @@ impl StockPolling {
     }
 
     async fn validate_tickers(&self, tickers: Vec<String>) -> Result<Vec<String>, StockError> {
-        let valid_tickers = self.list().await?;
-        let valid_tickers = valid_tickers.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<HashSet<_>>();
-        let invalid_tickers = tickers.iter().filter(|t| !valid_tickers.contains(t.as_str())).collect::<Vec<_>>();
-        if !invalid_tickers.is_empty() {
-            return Err(StockError::VoidTickersError(format!("Invalid tickers: {:?}", invalid_tickers)));
+        //let valid_tickers = self.list().await?;
+        //if valid_tickers.is_null() {
+        //    return Err(StockError::VoidTickersError("No tickers found (which is weird...)".to_string()));
+        //}
+        //let valid_tickers_array = valid_tickers.as_array().ok_or_else(|| StockError::ParseError("Failed to parse valid tickers".to_string()))?;
+        //let valid_tickers = valid_tickers_array.iter()
+        //    .filter_map(|v| serde_json::from_value::<Stock>(v.clone()).ok())
+        //    .map(|stock| stock.symbol)
+        //    .collect::<HashSet<_>>();
+        //let invalid_tickers = tickers.iter().filter(|t| !valid_tickers.contains(t.as_str())).collect::<Vec<_>>();
+        //if !invalid_tickers.is_empty() {
+        //    return Err(StockError::VoidTickersError(format!("Invalid tickers: {:?}", invalid_tickers)));
+        //}
+        if tickers.len() > self.batch_config.batch_size {
+            return Err(StockError::TooManyTickersError(format!("Too many tickers: {}", tickers.len())));
+        } else if tickers.is_empty() {
+            return Err(StockError::VoidTickersError("No tickers provided".to_string()));
         }
         Ok(tickers)
     }
@@ -325,11 +343,9 @@ impl StockPolling {
         &self,
         tickers: Vec<String>,
         fetch_type: FetchType,
-    ) -> Result<Value, StockError> {
+    ) -> Value {
         if tickers.is_empty() {
-            return Err(StockError::VoidTickersError(
-                "No tickers provided".to_string(),
-            ));
+            return Value::Null;
         }
     
         // Configurable concurrency limit
@@ -403,16 +419,12 @@ impl StockPolling {
         let elapsed = start.elapsed();
         gauge!("stock.batch_time", "rate limit" => format!("{}", elapsed.as_secs_f64()));
     
-        Ok(Value::Array(results))
+        Value::Array(results)
     }
 
-    async fn foward_value(&self, value: Value) -> Result<i32, StockError> {
-        todo!("Foward value to client or anoter service"); 
-        let status = 1;
-        Ok(status)
-    }    
+   
 
-    async fn poll_(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<(), StockError> {
+    async fn poll_(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<Value, StockError> {
         let config = Arc::clone(&self.batch_config);
 
         let tickers = self.validate_tickers(tickers).await?;
@@ -430,28 +442,31 @@ impl StockPolling {
             let future = tokio::spawn({
                 async move {
                     let _permit = semaphore.acquire().await.unwrap();
-                    let value= self_clone.process_batch(batch, fetch_type).await?;
-                    self_clone.foward_value(value).await
+                    let value= self_clone.process_batch(batch, fetch_type).await;
+                    drop(_permit);
+                    value
                 }
                 
             });
             futures.push(future);
         }
 
+        let mut results = Vec::new();
         for future in futures {
             match future.await {
-                Ok(value) => {
-                    info!("Fetched data: {:?}", value);
-                }
+                Ok(value) => results.push(value),
                 Err(e) => {
                     error!("Failed to fetch data: {}", e);
+                    results.push(Value::Null)
                 }
             }
         }
 
-        Ok(())
+        Ok(Value::Array(results))
     }
-    pub async fn poll(&self, value: &Value) -> Result<(), StockError> {
+
+
+    pub async fn poll(&self, value: &Value) -> Result<Value, StockError> {
         let tickers = value.get("tickers")
         .and_then(Value::as_array)
         .ok_or(StockError::ParseError("Missing 'tickers' field".to_string()))?

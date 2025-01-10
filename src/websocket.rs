@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#![allow(warnings)]
+#![allow(unused_variables)]
+
 use futures_util::{SinkExt, StreamExt, Future};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -7,7 +11,7 @@ use async_tungstenite::tungstenite::protocol::Message;
 use async_tungstenite::tungstenite::error::Error;
 use tungstenite::protocol::WebSocketConfig;
 use tokio::net::lookup_host;
-use serde_json::{to_value, Value};
+use serde_json::{to_value, from_str, Value};
 use serde::{Serialize, Deserialize};
 use crate::auth_config::BatchConfig;
 use crate::cache::SharedLockedCache;
@@ -29,7 +33,22 @@ use crate::stock::StockPolling;
 const REQUEST_SUCCUESS: u32 = 200;
 const REQUEST_FAILED: u32 = 400;
 const NOT_ALLOWED: u32 = 500;
+const REQUEST_TIMEOUT: u32 = 408;
+const REQUEST_CANCELED: u32 = 499;
+const REQUEST_INTERNAL_ERROR: u32 = 503;
+const NOT_FOUND: u32 = 404;     
+const REQUEST_RATE_LIMITED: u32 = 429;
 const CACHE_SIZE: usize = 1000;
+
+enum Outcome {
+    Failure,
+    NotAllowed,
+    Timeout,
+    Canceled,
+    InternalError,
+    NotFound,
+    RateLimited,
+}
 
 pub struct ServerSocket {
     address: String,
@@ -49,7 +68,7 @@ impl ServerSocket {
         }
     }
 
-    pub async fn run(&self) -> Result<(), Error> {
+    pub async fn run(&mut self) -> Result<(), Error> {
         println!("Resolving address: {}", self.address);
         let mut addrs = lookup_host(&self.address).await
             .map_err(|e| println!("Error resolving address: {}", e.to_string()))
@@ -64,6 +83,10 @@ impl ServerSocket {
         let listener = TcpListener::bind(&addr).await
             .map_err(|e| println!("Error: {}", e.to_string()))
             .unwrap();
+
+        println!("Building RMake...");
+        let _ = self.make.build();
+
         println!("WebSocket server listening on: {}", self.address);
 
         while let Ok((stream, addr)) = listener.accept().await {
@@ -102,11 +125,9 @@ impl ServerSocket {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    println!("**Received**: {}", text);
                     match serde_json::from_str::<Value>(&text) {
-                        Ok(json) => {
+                        Ok(_json) => {
                             let state = Arc::clone(&state);
-                            println!("**Parsed JSON**: {:?}", json);
                             println!("Making Response...");
                             let response = make.make(state, &text).await;
                             println!("Sending response...");
@@ -150,17 +171,17 @@ impl Default for PollState{
 }
 struct Collection;
 impl Collection {
-    async fn stock_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> String{
+    async fn stock_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
         let stock_polling = StockPolling::new(state.cache.clone(), state.batch_config.clone());
         stock_polling
             .poll(&args)
             .await
-            .map(|_| "Stock polling successful".to_string())
-            .unwrap_or_else(|e| format!("Stock polling failed: {}", e))
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Stock polling failed: {}", e)))
         
     }
 
-    fn stock_polling_func(state: Arc<PollState>, args: Arc<Value>) -> Pin<Box<dyn Future<Output = String> + Send + 'static>> {
+    fn stock_polling_func(state: Arc<PollState>, args: Arc<Value>) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
         Box::pin(async move {
             Collection::stock_polling_unpinned(state, args).await
         })
@@ -169,7 +190,7 @@ impl Collection {
 }
 
 
-type Func = fn(Arc<PollState>, Arc<Value>) -> Pin<Box<dyn Future<Output = String> + Send + 'static>>;
+type Func = fn(Arc<PollState>, Arc<Value>) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>>;
 
 #[derive(Clone)]
 pub struct MakeResponse{
@@ -186,19 +207,19 @@ impl MakeResponse {
         self.fn_map.insert(where_, Box::new(func));
     }
 
-    pub fn build(&mut self){
+    pub fn build(&mut self) {
         self.register_function("stock_polling".to_string(), Collection::stock_polling_func);
     }
 
-    pub async fn unsafe_make(&self, state: Arc<PollState>, s: &str) -> String {
+    pub async fn unsafe_make(&self, state: Arc<PollState>, s: &str) -> Value {
         let call_request: CallRequest = CallParser::key_lookup_parse_json(s).unwrap();
         if call_request.target.to_str() == "task" {
-           match call_request.args {
-               Args::TaskArgs(task_args) => {
+           match call_request.args.for_task {
+               Some(task_args) => {
                    let function = task_args.function;
                    let args = task_args.params;
                    if args.is_none() {
-                       return "Error: The argument hashmap is empty.".to_string();
+                       return from_str("Error: The argument hashmap is empty.").unwrap();
                    }
                    let where_ = task_args.look_for.where_;
                    match function {
@@ -208,10 +229,9 @@ impl MakeResponse {
                             let args= Arc::new(to_value(args.unwrap().clone()).unwrap());
                             let message = self.exec_func(&func, state, args)
                                 .await
-                                .map_err(|e| self.return_error(e.to_string()));
-                            let status = REQUEST_SUCCUESS;
-                            let response = ServerResponse::new(status, Some(message.unwrap().clone()));
-                            return response.to_json();
+                                .map_err(|e| self.return_error(Outcome::Failure, e.to_string()));
+                            return  self.return_success(message.unwrap());
+
                        }
                        _ => {}
                    }
@@ -219,55 +239,72 @@ impl MakeResponse {
                _ => {}
            }
         }
-        ServerResponse::new(REQUEST_SUCCUESS, Some(s.to_string())).to_json()
+        ServerResponse::new(REQUEST_SUCCUESS, None, None).to_json()
     }
 
-    pub async fn make(&self, state: Arc<PollState>, s: &str) -> String {
+    pub async fn make(&self, state: Arc<PollState>, s: &str) -> Value {
+        println!("Parsing request...");
         let call_request = match CallParser::key_lookup_parse_json(s) {
             Ok(req) => req,
-            Err(err) => return ServerResponse::new(REQUEST_FAILED, Some(err)).to_json(),
+            Err(err) => return self.return_error(Outcome::Failure, err),
         };
-        println!("**Call request**: {:#?}", call_request);
     
         if call_request.target.to_str() == "task" {
-            if let Args::TaskArgs(task_args) = call_request.args {
+            if let Some(task_args) = call_request.args.for_task {
                 if let TaskFunction::AggregatedPolling = task_args.function {
                     return self.handle_task(state, task_args).await;
                 }
             }
         }
     
-        ServerResponse::new(NOT_ALLOWED, Some(s.to_string())).to_json()
+        self.return_error(Outcome::NotAllowed, "Invalid request".to_string())
     }
-    async fn handle_task(&self, state: Arc<PollState>, task_args: TaskArgs) -> String {
+    async fn handle_task(&self, state: Arc<PollState>, task_args: TaskArgs) -> Value {
         let where_ = task_args.look_for.where_;
+        println!("Extracting Args...");
         if let Some(args) = task_args.params {
+            println!("Executing task function: {}", &where_);
             if let Some(func) = self.map_func(&where_) {
                 let args = Arc::new(to_value(args).unwrap());
                 let result = func(state, args).await;
-                return ServerResponse::new(REQUEST_SUCCUESS, Some(result)).to_json();
+                return self.return_success(result);
+            } else {
+                println!("Invalid task function: {}", &where_);
+                return self.return_error(Outcome::Failure, format!("Invalid task function: {}", &where_));
             }
         }
     
-        ServerResponse::new(REQUEST_FAILED, Some("Function not found or invalid arguments".to_string())).to_json()
+        self.return_error(Outcome::Failure, "Invalid task arguments".to_string())
     }
     
     fn map_func(&self, where_: &String) -> Option<Box<Func>> {
-        if let Some(func) = self.fn_map.get(where_) {
+        if let Some(func) = self.fn_map.get(where_).cloned() {
             Some(func.clone())
         } else {
             None
         }
     }
 
-    async fn exec_func(&self, func: &Func, state: Arc<PollState>, args: Arc<Value>) -> Result<String, Error> {
+    async fn exec_func(&self, func: &Func, state: Arc<PollState>, args: Arc<Value>) -> Result<Value, Error> {
         let result = func(state, args).await;
         Ok(result)
     }
 
-    fn return_error(&self, msg: String) -> ServerResponse {
-        let status = REQUEST_FAILED;
-        ServerResponse::new(status, Some(msg.to_string()))
+    fn return_success(&self, message: Value) -> Value {
+        ServerResponse::new(REQUEST_SUCCUESS, Some(message), None).to_json()
+    }
+
+    fn return_error(&self, outcome: Outcome, reason: String) -> Value {
+        let status = match outcome {
+            Outcome::Failure => REQUEST_FAILED,
+            Outcome::Canceled => REQUEST_CANCELED,
+            Outcome::Timeout => REQUEST_TIMEOUT,
+            Outcome::NotAllowed => NOT_ALLOWED,
+            Outcome::NotFound => NOT_FOUND,
+            Outcome::RateLimited=> REQUEST_RATE_LIMITED,
+            Outcome::InternalError => REQUEST_INTERNAL_ERROR,
+        };
+        ServerResponse::new(status, None, Some(reason)).to_json()
 
     }
 }
@@ -276,17 +313,20 @@ impl MakeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerResponse {
     pub status: u32,
-    pub message: Option<String>,
+    pub message: Option<Value>,
+    pub reason: Option<String>,  // Only for failed requests
 }
 impl ServerResponse {
-    pub fn new(status: u32, message: Option<String>) -> Self {
+    pub fn new(status: u32, message: Option<Value>, reason: Option<String>) -> Self {
         Self {
             status,
             message,
+            reason,
         }
     }
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
+
+    pub fn to_json(&self) -> Value {
+        serde_json::to_value(self).unwrap()
     }
     
 }
@@ -295,7 +335,7 @@ impl ServerResponse {
 
 
 
-pub async fn main_() -> Result<(), Error> {
-    let server = ServerSocket::new("0.0.0.0:8080");
+pub async fn run() -> Result<(), Error> {
+    let mut server = ServerSocket::new("0.0.0.0:8080");
     server.run().await
 }

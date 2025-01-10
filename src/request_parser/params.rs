@@ -176,17 +176,11 @@ impl TaskCount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookFor {
     pub where_: String,
-    pub what: Option<String>,
-    pub when: Option<String>,
-    pub how: Option<String>,
 }
 impl LookFor {
     pub fn from_str(s: &str) -> Self {
         LookFor {
             where_: s.to_string(),
-            what: None,
-            when: None,
-            how: None,
         }
     }
 }
@@ -286,10 +280,9 @@ impl TargetService {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Args {
-    DatabaseArgs(DatabaseArgs),
-    TaskArgs(TaskArgs),
-    Unknown
+pub struct Args {
+    pub for_database: Option<DatabaseArgs>,
+    pub for_task: Option<TaskArgs>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
