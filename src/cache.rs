@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#![allow(warnings)]
+#![allow(unused_variables)]
+
 use std::time::Instant;
 use lru::LruCache;
 use serde_json::Value;
@@ -10,26 +14,26 @@ type CacheValue = (Value, Instant);
 type LruCacheType = LruCache<String, CacheValue>;
 
 
-enum Lock<'a> {
+pub enum Lock<'a> {
     Mutex(MutexGuard<'a, LruCache<String, (Value, Instant)>>),
     ReadRwLock(RwLockReadGuard<'a, LruCache<String, (Value, Instant)>>),
     WriteRwLock(RwLockWriteGuard<'a, LruCache<String, (Value, Instant)>>),
 }
 
 impl<'a> Lock<'a> {
-    fn as_mutex(&self) -> Option<&MutexGuard<'a, LruCache<String, (Value, Instant)>>> {
+    pub fn as_mutex(&self) -> Option<&MutexGuard<'a, LruCache<String, (Value, Instant)>>> {
         match self {
             Lock::Mutex(lock) => Some(lock),
             _ => None,
         }
     }
-    fn as_read_rw_lock(&self) -> Option<&RwLockReadGuard<'a, LruCache<String, (Value, Instant)>>> {
+    pub fn as_read_rw_lock(&self) -> Option<&RwLockReadGuard<'a, LruCache<String, (Value, Instant)>>> {
         match self {
             Lock::ReadRwLock(lock) => Some(lock),
             _ => None,
         }
     }
-    fn as_write_rw_lock(&self) -> Option<&RwLockWriteGuard<'a, LruCache<String, (Value, Instant)>>> {
+    pub fn as_write_rw_lock(&self) -> Option<&RwLockWriteGuard<'a, LruCache<String, (Value, Instant)>>> {
         match self {
             Lock::WriteRwLock(lock) => Some(lock),
             _ => None,

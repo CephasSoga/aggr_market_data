@@ -28,16 +28,24 @@ use crate::stock::StockPolling;
 
 const REQUEST_SUCCUESS: u32 = 200;
 const REQUEST_FAILED: u32 = 400;
+const NOT_ALLOWED: u32 = 500;
 const CACHE_SIZE: usize = 1000;
 
 pub struct ServerSocket {
     address: String,
+    make: MakeResponse,
+    state: Arc<PollState>,
 }
 
 impl ServerSocket {
     pub fn new(address: &str) -> Self {
         Self {
             address: address.to_string(),
+            make: MakeResponse::new(),
+            state: Arc::new(PollState {
+                cache: Arc::new(Mutex::new(SharedLockedCache::new(CACHE_SIZE))),
+                batch_config: Arc::new(BatchConfig::default()),
+            }),
         }
     }
 
@@ -60,13 +68,13 @@ impl ServerSocket {
 
         while let Ok((stream, addr)) = listener.accept().await {
             println!("New connection from: {}", addr);
-            tokio::spawn(Self::handle_connection(stream));
+            tokio::spawn(Self::handle_connection(stream, self.make.clone(), self.state.clone()));
         }
 
         Ok(())
     }
 
-    async fn handle_connection(stream: TcpStream) {
+    async fn handle_connection(stream: TcpStream, make: MakeResponse, state: Arc<PollState>) {
         let config = Some(WebSocketConfig::default());
 
 
@@ -94,13 +102,18 @@ impl ServerSocket {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    println!("Received: {}", text);
+                    println!("**Received**: {}", text);
                     match serde_json::from_str::<Value>(&text) {
                         Ok(json) => {
-                            println!("Parsed JSON: {:?}", json);
-                            if let Err(_) = tx.send(format!("Echo: {}", json)).await {
+                            let state = Arc::clone(&state);
+                            println!("**Parsed JSON**: {:?}", json);
+                            println!("Making Response...");
+                            let response = make.make(state, &text).await;
+                            println!("Sending response...");
+                            if let Err(_) = tx.send(format!("{}", &response)).await {
                                 break;
                             }
+                            println!("Response sent");
                         }
                         Err(e) => {
                             println!("Failed to parse JSON: {}", e);
@@ -157,6 +170,8 @@ impl Collection {
 
 
 type Func = fn(Arc<PollState>, Arc<Value>) -> Pin<Box<dyn Future<Output = String> + Send + 'static>>;
+
+#[derive(Clone)]
 pub struct MakeResponse{
     fn_map: HashMap<String, Box<Func>>,
 }
@@ -175,7 +190,7 @@ impl MakeResponse {
         self.register_function("stock_polling".to_string(), Collection::stock_polling_func);
     }
 
-    pub async fn make(&self, state: Arc<PollState>, s: &str) -> String {
+    pub async fn unsafe_make(&self, state: Arc<PollState>, s: &str) -> String {
         let call_request: CallRequest = CallParser::key_lookup_parse_json(s).unwrap();
         if call_request.target.to_str() == "task" {
            match call_request.args {
@@ -207,21 +222,23 @@ impl MakeResponse {
         ServerResponse::new(REQUEST_SUCCUESS, Some(s.to_string())).to_json()
     }
 
-    pub async fn make_(&self, state: Arc<PollState>, s: &str) -> String {
+    pub async fn make(&self, state: Arc<PollState>, s: &str) -> String {
         let call_request = match CallParser::key_lookup_parse_json(s) {
             Ok(req) => req,
-            Err(_) => return ServerResponse::new(REQUEST_FAILED, Some("Invalid request".into())).to_json(),
+            Err(err) => return ServerResponse::new(REQUEST_FAILED, Some(err)).to_json(),
         };
+        println!("**Call request**: {:#?}", call_request);
     
         if call_request.target.to_str() == "task" {
             if let Args::TaskArgs(task_args) = call_request.args {
-                return self.handle_task(state, task_args).await;
+                if let TaskFunction::AggregatedPolling = task_args.function {
+                    return self.handle_task(state, task_args).await;
+                }
             }
         }
     
-        ServerResponse::new(REQUEST_SUCCUESS, Some(s.to_string())).to_json()
+        ServerResponse::new(NOT_ALLOWED, Some(s.to_string())).to_json()
     }
-    
     async fn handle_task(&self, state: Arc<PollState>, task_args: TaskArgs) -> String {
         let where_ = task_args.look_for.where_;
         if let Some(args) = task_args.params {
