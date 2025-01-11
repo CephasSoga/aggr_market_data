@@ -23,7 +23,7 @@ use lru::LruCache;
 use tokio::sync::Mutex;
 use thiserror::Error;
 
-use crate::auth_config::{RetryConfig, BatchConfig};
+use crate::config::{RetryConfig, BatchConfig};
 
 #[derive(Debug, Clone)]
 pub enum FetchType {

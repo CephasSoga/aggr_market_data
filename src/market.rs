@@ -11,7 +11,7 @@ use futures_util::Future;
 use metrics::{counter, gauge};
 use tracing::{info, error};
 use tokio::sync::Semaphore;
-use crate::auth_config::BatchConfig;
+use crate::config::BatchConfig;
 use serde_json::Value;
 use crate::request::make_request;
 

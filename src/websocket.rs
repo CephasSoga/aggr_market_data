@@ -13,7 +13,7 @@ use tungstenite::protocol::WebSocketConfig;
 use tokio::net::lookup_host;
 use serde_json::{to_value, from_str, Value};
 use serde::{Serialize, Deserialize};
-use crate::auth_config::BatchConfig;
+use crate::config::BatchConfig;
 use crate::cache::SharedLockedCache;
 use crate::request_parser::parser::CallParser;
 use crate::request_parser::params::*;
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::pin::Pin;
 
-
+use crate::request::HTTPClient;
 use crate::stock::StockPolling;
 //use crate::crypto::CryptoPolling;
 //use crate::forex::ForexPolling;
@@ -61,10 +61,7 @@ impl ServerSocket {
         Self {
             address: address.to_string(),
             make: MakeResponse::new(),
-            state: Arc::new(PollState {
-                cache: Arc::new(Mutex::new(SharedLockedCache::new(CACHE_SIZE))),
-                batch_config: Arc::new(BatchConfig::default()),
-            }),
+            state: Arc::new(PollState::default()),
         }
     }
 
@@ -160,19 +157,25 @@ impl ServerSocket {
 pub struct PollState {
     cache: Arc<Mutex<SharedLockedCache>>,
     batch_config: Arc<BatchConfig>,
+    http_client: Arc<HTTPClient>,
 }
 impl Default for PollState{
     fn default() -> Self {
         Self {
             cache: Arc::new(Mutex::new(SharedLockedCache::new(CACHE_SIZE))),
             batch_config: Arc::new(BatchConfig::default()),
+            http_client: Arc::new(HTTPClient::new().expect("Failed to create HTTP client")),
         }
     }
 }
 struct Collection;
 impl Collection {
     async fn stock_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
-        let stock_polling = StockPolling::new(state.cache.clone(), state.batch_config.clone());
+        let stock_polling = StockPolling::new(
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.http_client.clone(),
+        );
         stock_polling
             .poll(&args)
             .await

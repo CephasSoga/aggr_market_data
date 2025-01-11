@@ -2,7 +2,7 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
-use crate::request::{make_request, generate_json};
+use crate::request::HTTPClient;
 use serde_json::{json, Value};
 
 /// Functions for searching financial instruments in the FMP API.

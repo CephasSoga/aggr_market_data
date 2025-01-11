@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::request::{make_request, generate_json};
+use crate::request::HTTPClient;
 use crate::financial::Financial;
 use serde::de::value;
 use tokio::time::sleep;
@@ -23,9 +23,20 @@ use tokio::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::auth_config::{RetryConfig, BatchConfig};
+use crate::config::{RetryConfig, BatchConfig};
 use crate::cache::{Cache, SharedCache, SharedLockedCache};
 
+
+const LIST_PATH: &str = "stoc/list";
+const QUOTE_PATH: &str = "quote";
+const RATING_PATH: &str = "company/rating";
+const PROFILE_PATH: &str= "profile";
+const OUTLOOK_PATH: &str = "company-outlook";
+const FINANCIAL_PATH: &str = "financial";
+const CURRENT_PRICE_PATH: &str = "real-time-price";
+const HISTORY_PATH: &str = "historical-price-full";
+const SPLIT_HISTORY_PATH: &str = "stock_split";
+const DIVIDEND_HISTORY_PATH: &str = "stock_dividend";
 
 pub trait FunctionArgs {
     fn expected_args() -> Vec<&'static str>;
@@ -37,7 +48,7 @@ pub enum FetchType {
     Financial,
     Profile,
     Rating,
-    CurrentPrice,
+    Outlook,
     History,
     DividendHistory,
     SplitHistory,
@@ -49,7 +60,7 @@ impl FetchType {
             "financial" => FetchType::Financial,
             "profile" => FetchType::Profile,
             "rating" => FetchType::Rating,
-            "current_price" => FetchType::CurrentPrice,
+            "outlook" => FetchType::Outlook,
             "history" => FetchType::History,
             "dividend_history" => FetchType::DividendHistory,
             "split_history" => FetchType::SplitHistory,
@@ -92,13 +103,18 @@ pub enum StockError {
 pub struct StockPolling {
    cache: Arc<Mutex<SharedLockedCache>>,
    batch_config: Arc<BatchConfig>,
+   http_client: Arc<HTTPClient>,
 }
 
 impl StockPolling {
-    pub fn new(cache: Arc<Mutex<SharedLockedCache>>, batch_config:Arc<BatchConfig>) -> Self {
+    pub fn new(
+        cache: Arc<Mutex<SharedLockedCache>>, 
+        batch_config:Arc<BatchConfig>, 
+        http_client: Arc<HTTPClient>) -> Self {
         Self {
             cache,
             batch_config,
+            http_client,
         }
     }
 
@@ -109,19 +125,23 @@ impl StockPolling {
         ttl: Duration,
     ) ->   Result<Value, StockError> 
     where F: Future<Output = Result<Value, StockError>> {
+        println!("Looking in cache");
         let mut cache = self.cache.lock().await;
         if let Some((value, instant)) = cache.get(key).await {
+            println!("Found in cache");
             if instant.elapsed() < Duration::from_secs(60) {
                 return Ok(value.clone());
             } else {
+                println!("Expired");
                 cache.pop(key);// Expired
             }
         }
-        
+        println!("Fetching...");
         // Fetch and cache the value
         let result = fetch_fn.await;
         match result {
             Ok(value) => {
+                println!("Got value: {:?}", value);
                 cache.put(key.to_string(), (value.clone(), Instant::now()));
                 Ok(value)
             }
@@ -133,7 +153,7 @@ impl StockPolling {
         let cache_key = format!("stock/list");
         
         let fetch_fn = async  {
-            make_request("stock/list", HashMap::new()).await
+            self.http_client.get(LIST_PATH, None).await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch stock list: {}", e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
@@ -142,11 +162,12 @@ impl StockPolling {
     pub async fn profile(&self, symbol: &str) -> Result<Value, StockError> {
         let cache_key = format!("stock/{}", symbol);
         
+        let path = self.http_client.join(vec![PROFILE_PATH, symbol]);
         let fetch_fn = async  {
-            make_request(
-                "profile",
-                generate_json(Value::String(symbol.to_string()), None)
-            ).await
+            self.http_client.get(
+                path.as_str(),
+                None)
+            .await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch stock profile for {}: {}", symbol, e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
@@ -155,11 +176,12 @@ impl StockPolling {
     pub async fn quote(&self, symbol: &str) -> Result<Value, StockError> {
         let cache_key = format!("quote/{}", symbol);
         
+        let path = self.http_client.join(vec![QUOTE_PATH, symbol]);
         let fetch_fn = async {
-            make_request(
-                "quote",
-                generate_json(Value::String(symbol.to_string()), None)
-            ).await
+            self.http_client.get(
+                path.as_str(),
+                None)
+            .await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch quote for {}: {}", symbol, e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
@@ -169,7 +191,7 @@ impl StockPolling {
         let cache_key = format!("financial/{}", symbol);
         
         let fetch_fn = async {
-            let financial_req = Financial::new(symbol);
+            let financial_req = Financial::new(symbol, self.http_client.clone());
             let res_hash = financial_req.all().await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch financial data for {}: {}", symbol, e.to_string())))
             .unwrap();
@@ -187,28 +209,30 @@ impl StockPolling {
     pub async fn rating(&self, symbol: &str) -> Result<Value, StockError> {
         let cache_key = format!("rating/{}", symbol);
         
+        let path = self.http_client.join(vec![RATING_PATH, symbol]);
         let fetch_fn = async {
-            make_request(
-                "company/rating",
-                generate_json(Value::String(symbol.to_string()), None)
-            ).await
+            self.http_client.get(path.as_str(), None)
+            .await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch rating for {}: {}", symbol, e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
 
-    pub async fn current_price(&self, symbol: &str) -> Result<Value, StockError> {
-        let cache_key = format!("current_price/{}", symbol);
+    pub async fn outlook(&self, symbol: &str) -> Result<Value, StockError> {
+        let cache_key = format!("outlook/{}", symbol);
+        let query_params = json!({"symbol": symbol,});
+        let query_params = self.http_client.build_query_from_value(query_params);
         
         let fetch_fn = async {
-            make_request(
-                "stock/real-time-price",
-                generate_json(Value::String(symbol.to_string()), None)
-            ).await
-            .map_err(|e| StockError::FetchError(format!("Failed to fetch current price for {}: {}", symbol, e.to_string())))
+            self.http_client.get_v4(
+                OUTLOOK_PATH,
+                Some(query_params))
+            .await
+            .map_err(|e| StockError::FetchError(format!("Failed to fetch outlook for {}: {}", symbol, e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
+
 
     pub async fn history(
         &self,
@@ -227,65 +251,43 @@ impl StockPolling {
                 "serietype": data_type,
                 "timeseries": limit
             });
+            let query_params = self.http_client.build_query_from_value(query_params);
+            let path = self.http_client.join(vec![HISTORY_PATH, symbol]);
 
-            make_request(
-                "historical-price-full",
-                generate_json(Value::String(symbol.to_string()), Some(query_params))
-            ).await
+            self.http_client.get(
+                path.as_str(),
+                Some(query_params),
+            )
+            .await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch history for {}: {}", symbol, e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
 
-    pub async fn dividend_history(
-        &self,
-        symbol: &str,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-        data_type: Option<&str>,
-        limit: Option<i32>,
-    ) -> Result<Value, StockError> {
+    pub async fn dividend_history(&self, symbol: &str) -> Result<Value, StockError> {
         let cache_key = format!("dividend_history/{}", symbol);
         
         let fetch_fn = async {
-            let query_params = json!({
-                "from": start_date,
-                "to": end_date,
-                "serietype": data_type,
-                "timeseries": limit
-            });
+            let path = self.http_client.join(vec![HISTORY_PATH, DIVIDEND_HISTORY_PATH, symbol]);
 
-            make_request(
-                "historical-price-full/stock_dividend",
-                generate_json(Value::String(symbol.to_string()), Some(query_params))
-            ).await
+            self.http_client.get(
+                path.as_str(),
+                None) 
+            .await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch dividend history for {}: {}", symbol, e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
     }
 
-    pub async fn split_history(
-        &self,
-        symbol: &str,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-        data_type: Option<&str>,
-        limit: Option<i32>,
-    ) -> Result<Value, StockError> {
+    pub async fn split_history(&self, symbol: &str) -> Result<Value, StockError> {
         let cache_key = format!("split_history/{}", symbol);
         
         let fetch_fn = async {
-            let query_params = json!({
-                "from": start_date,
-                "to": end_date,
-                "serietype": data_type,
-                "timeseries": limit
-            });
-
-            make_request(
-                "historical-price-full/stock_split",
-                generate_json(Value::String(symbol.to_string()), Some(query_params))
-            ).await
+            let path = self.http_client.join(vec![HISTORY_PATH, SPLIT_HISTORY_PATH, symbol]);
+            self.http_client.get(
+                SPLIT_HISTORY_PATH,
+                None)
+            .await
             .map_err(|e| StockError::FetchError(format!("Failed to fetch split history for {}: {}", symbol, e.to_string())))
         };
         self.get_cached_or_fetch(&cache_key, fetch_fn, self.batch_config.cache_ttl).await
@@ -358,9 +360,14 @@ impl StockPolling {
 
         let cache_clone = Arc::clone(&self.cache);
         let config_clone = Arc::clone(&self.batch_config);
+        let http_client_clone = Arc::clone(&self.http_client);
 
         // Shared self
-        let shared_self = Arc::new(Self::new(cache_clone, config_clone));
+        let shared_self = Arc::new(Self::new(
+            cache_clone, 
+            config_clone, 
+            http_client_clone
+        ));
     
         for ticker in tickers {
             let permit = semaphore.clone().acquire_owned().await.unwrap(); // Acquire semaphore permit
@@ -378,10 +385,10 @@ impl StockPolling {
                         FetchType::Financial => self_clone.financial(&ticker).await,
                         FetchType::Profile => self_clone.profile(&ticker).await,
                         FetchType::Rating => self_clone.rating(&ticker).await,
-                        FetchType::CurrentPrice => self_clone.current_price(&ticker).await,
+                        FetchType::Outlook => self_clone.outlook(&ticker).await,
                         FetchType::History => self_clone.history(&ticker, None, None, None, None).await,
-                        FetchType::DividendHistory => self_clone.dividend_history(&ticker, None, None, None, None).await,
-                        FetchType::SplitHistory => self_clone.split_history(&ticker, None, None, None, None).await,
+                        FetchType::DividendHistory => self_clone.dividend_history(&ticker).await,
+                        FetchType::SplitHistory => self_clone.split_history(&ticker).await,
                         _ => unreachable!(),
                     }
                 };
@@ -436,8 +443,9 @@ impl StockPolling {
             let batch = chunk.to_vec();
 
             let cache_clone = Arc::clone(&self.cache);
+            let http_client_clone = Arc::clone(&self.http_client);
 
-            let self_clone = Self::new(cache_clone, config.clone());
+            let self_clone = Self::new(cache_clone, config.clone(), http_client_clone);
 
             let future = tokio::spawn({
                 async move {

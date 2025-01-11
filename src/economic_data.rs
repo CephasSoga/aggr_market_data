@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use futures_util::Future;
 use std::fmt::Display;
-use crate::auth_config::{TimeConfig, BatchConfig};
+use crate::config::{TimeConfig, BatchConfig};
 use crate::utils::{now, ago_secs};
 
 

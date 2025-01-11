@@ -3,98 +3,91 @@
 #![allow(unused_variables)]
 
 use std::collections::HashMap;
-
-use crate::request::{make_request, generate_json};
+use std::sync::Arc;
+use crate::request::HTTPClient;
 use serde_json::{json, Value};
+
+const INCOME_PATH: &str = "income-statement";
+const BALANCE_PATH: &str = "balance-sheet-statement";
+const CASHFLOW_PATH: &str = "cash-flow-statement";
+const METRICS_PATH: &str = "key-metrics-ttm";
+const GROWTH_PATH: &str = "financial-growth";
+const VALUE_PATH: &str = "enterprise-values";
+const RATIO_PATH: &str = "ratios-ttm";
+const DCF_PATH: &str = "advanced_discounted_cash_flow";
 
 /// Functions for accessing financial statement data from the FMP API
 pub struct Financial<'a> {
     symbol: &'a str,
+    http_client: Arc<HTTPClient>,
 }
 
 impl<'a> Financial<'a> {
-    pub fn new(symbol: &'a str) -> Self {
-        Self { symbol }
+    pub fn new(symbol: &'a str, http_client: Arc<HTTPClient>) -> Self {
+        Self { symbol, http_client }
     }
 
     pub async fn income(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
         });
-
-        make_request(
-            "financials/income-statement",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+        let path = self.http_client.join(vec![INCOME_PATH, self.symbol]);
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get(path.as_str(), Some(query_params)).await
     }
 
     pub async fn balance(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
         });
-
-        make_request(
-            "financials/balance-sheet-statement",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+        let path = self.http_client.join(vec![BALANCE_PATH, self.symbol]);
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get(path.as_str(), Some(query_params)).await
     }
 
     pub async fn cashflow(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
         });
-
-        make_request(
-            "financials/cash-flow-statement",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+        let path = self.http_client.join(vec![CASHFLOW_PATH, self.symbol]);
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get(path.as_str(), Some(query_params)).await
     }
 
     pub async fn metrics(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
-        let query_params = json!({
-            "period": period.unwrap_or("annual")
-        });
-
-        make_request(
-            "company-key-metrics",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+        let path = self.http_client.join(vec![METRICS_PATH, self.symbol]);
+        self.http_client.get(METRICS_PATH, None).await
     }
 
     pub async fn growth(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
             "period": period.unwrap_or("annual")
         });
-
-        make_request(
-            "financial-statement-growth",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+        let path = self.http_client.join(vec![GROWTH_PATH, self.symbol]);
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get(path.as_str(), Some(query_params)).await
     }
 
     pub async fn company_value(&self, period: Option<&str>) -> Result<Value, reqwest::Error> {
         let query_params = json!({
-            "period": period.unwrap_or("annual")
+            "period": period.unwrap_or("quarter")
         });
-
-        make_request(
-            "enterprise-value",
-            generate_json(Value::String(self.symbol.to_string()), Some(query_params))
-        ).await
+        let path = self.http_client.join(vec![VALUE_PATH, self.symbol]);
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get(path.as_str(), Some(query_params)).await
     }
 
     pub async fn ratios(&self) -> Result<Value, reqwest::Error> {
-        make_request(
-            "financial-ratios",
-            generate_json(Value::String(self.symbol.to_string()), None)
-        ).await
+        let path = self.http_client.join(vec![RATIO_PATH, self.symbol]);
+        self.http_client.get(path.as_str(), None).await
     }
 
     pub async fn dcf(&self) -> Result<Value, reqwest::Error> {
-        make_request(
-            "discounted-cash-flow",
-            generate_json(Value::String(self.symbol.to_string()), None)
-        ).await
+        let query_params = json!({
+            "symbol": self.symbol
+        });
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get_v4(DCF_PATH, Some(query_params)).await
     }
 
     pub async fn all(&self) -> Result<HashMap<String, Value>, reqwest::Error> {
@@ -115,7 +108,7 @@ impl<'a> Financial<'a> {
 
 
 pub async fn example() -> Result<(), reqwest::Error> {
-    let aapl = Financial::new("AAPL");
+    let aapl = Financial::new("AAPL", Arc::new(HTTPClient::new().unwrap()));
     
     // Get annual income statement
     let income = aapl.income(None).await?;

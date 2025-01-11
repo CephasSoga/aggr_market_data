@@ -18,7 +18,7 @@ use std::fmt::Display;
 use lru::LruCache;
 use std::sync::Mutex;
 
-use crate::auth_config::BatchConfig;
+use crate::config::BatchConfig;
 
 
 

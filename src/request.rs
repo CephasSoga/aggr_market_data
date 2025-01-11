@@ -1,172 +1,101 @@
-#![allow(dead_code)]
-#![allow(warnings)]
-#![allow(unused_variables)]
-
-use reqwest;
-use serde_json::Value;
+use reqwest::Client;
+use std::sync::Arc;
 use std::collections::HashMap;
-use crate::auth_config::Config;
+use crate::config::Config;
+use serde_json::Value;
 
-/// The base api/v3 URL for the Financial Modeling Prep API.
-const BASE_URL: &str = "https://financialmodelingprep.com/api/v3/";
-
-/// Creates the api/v3 endpoint using the default base URL and adding the respective
-/// path and query parameters to be requested by the API.
-///
-/// Future Use: In case of querying a new database in the future, this is the
-/// only function that would require modification for the most part to control how.
-/// data is queried.
-///
-/// ## Arguments
-///
-/// * `params` - A HashMap containing query and path parameters to be passed to the API.
-///
-/// ## Returns
-///
-/// A String that represents the REST API request to be made to FMP API.
-fn url(params: &HashMap<String, Value>, config: Config) -> String {
-    let query_parameters = params.get("query").and_then(|v| v.as_object());
-    let path_parameters = params.get("path");
-    let url_path = params.get("urlPath").and_then(|v| v.as_str()).unwrap_or("");
-    let mut url = String::from(BASE_URL);
-    let mut query_string = String::new();
-    let apikey = config.auth.token;
-
-    url.push_str(url_path);
-
-    if let Some(path_params) = path_parameters {
-        let path_str = match path_params {
-            Value::Array(arr) => arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
-            _ => path_params.to_string(),
-        };
-        url.push('/');
-        url.push_str(&path_str.to_uppercase());
-    }
-
-    if let Some(query_params) = query_parameters {
-        for (key, value) in query_params {
-            if !value.is_null() {
-                query_string.push_str(&format!("{}={}&", key, value));
-            }
-        }
-        if !query_string.is_empty() {
-            query_string.pop(); // Remove trailing '&'
-            url.push('?');
-            url.push_str(&query_string);
-        }
-    }
-
-    if query_string.is_empty() {
-        url.push('?');
-    } else {
-        url.push('&');
-    }
-
-    url.push_str(&format!("apikey={}", apikey));
-
-    url
+#[derive(Debug, Clone)]
+pub struct HTTPClient {
+    client: Arc<Client>,
+    headers: HashMap<String, String>,
+    base_url: String,
+    base_url_v4: String,
+    config: Config,
 }
 
-/// Generates a nested JSON Object to accommodate all the necessary parameters.
-/// that are going to be passed to FMP's REST API.
-///
-/// # Arguments
-///
-/// * `path_param` - A Value that represents the path of the endpoint.
-/// * `query_param` - An Option<Value> that contains key-value pairs to be added to the query parameters.
-///
-/// ## Returns
-///
-/// A HashMap that contains the respective query and path parameters which will be parsed by `url` function.
-pub fn generate_json(path_param: Value, query_param: Option<Value>) -> HashMap<String, Value> {
-    let mut params = HashMap::new();
-    params.insert("query".to_string(), query_param.unwrap_or(Value::Null));
-    params.insert("path".to_string(), path_param);
-    params
-}
+const BASE_URL_V3: &str = "https://financialmodelingprep.com/api/v3/";
+const BASE_URL_V4: &str = "https://financialmodelingprep.com/api/v4/";
+const MAX_CLIENT_POOL_SIZE: usize = 1024;
 
-/// Makes a GET request to the specified api/v3 path with the given parameters.
-///
-/// ## Arguments
-///
-/// * `path` - A string slice that holds the API endpoint path.
-/// * `params` - A HashMap containing additional parameters for the request.
-///
-/// ## Returns
-///
-/// A Result containing either the JSON response or an error.
-pub async fn make_request(path: &str, params: HashMap<String, Value>) -> Result<Value, reqwest::Error> {
-    let mut request_params = params;
-    request_params.insert("urlPath".to_string(), Value::String(path.to_string()));
-
-    let config = Config::new().expect("Could not read Configurations.");
-    let url = url(&request_params, config);
-
-    let client = reqwest::Client::new();
-    let response = client.get(&url).send().await?;
-    response.json::<Value>().await
-}
-
-
-/// The base api/v4 URL for the Financial Modeling Prep API.
-const BASE_URL_2: &str = "https://financialmodelingprep.com/api/v4/";
-
-
-/// Creates the api/v4 endpoint using the default base URL and adding the respective
-/// path and query parameters to be requested by the API.
-fn url_2(params: &HashMap<String, Value>, config: Config) -> String {
-    let query_parameters = params.get("query").and_then(|v| v.as_object());
-    let path_parameters = params.get("path");
-    let url_path = params.get("urlPath").and_then(|v| v.as_str()).unwrap_or("");
-    let mut url = String::from(BASE_URL);
-    let mut query_string = String::new();
-    let apikey = config.auth.token;
-
-    url.push_str(url_path);
-
-    if let Some(path_params) = path_parameters {
-        let path_str = match path_params {
-            Value::Array(arr) => arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
-            _ => path_params.to_string(),
-        };
-        url.push('/');
-        url.push_str(&path_str.to_uppercase());
+impl HTTPClient {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            client: Arc::new(Client::builder()
+            .pool_max_idle_per_host(MAX_CLIENT_POOL_SIZE)
+            .build()?),
+            headers: HashMap::new(),
+            base_url: BASE_URL_V3.to_string(),
+            base_url_v4: BASE_URL_V4.to_string(),
+            config: Config::new()?,
+        })
     }
 
-    if let Some(query_params) = query_parameters {
-        for (key, value) in query_params {
-            if !value.is_null() {
-                query_string.push_str(&format!("{}={}&", key, value));
-            }
+    fn build_query(&self, mut query_params: Vec<(String, String)>) -> Vec<(String, String)> {
+                query_params.push(("apikey".to_string(), self.config.auth.token.clone()));
+                query_params
+    }
+
+    pub fn build_query_from_value(&self, query_params: Value) -> Vec<(String, String)> {
+        // Convert the JSON object to a Vec<(String, String)>
+        let query_vec: Vec<(String, String)> = query_params.as_object()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, value)| {
+                value.as_str().map(|v| (key.clone(), v.to_string()))
+            })
+            .collect();
+        query_vec
+    }
+
+    pub fn join<I, S>(&self, path_parts: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        path_parts
+            .into_iter()
+            .map(|part| part.as_ref().trim_matches('/').to_string())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+
+    pub fn set_header(&mut self, key: &str, value: &str) {
+        self.headers.insert(key.to_string(), value.to_string());
+    }
+
+    pub async fn get(&self, url: &str, query_params: Option<Vec<(String, String)>>) -> Result<Value, reqwest::Error> {
+        println!("Maiking request with query: {:?}", query_params);
+        let url = format!("{}/{}", self.base_url.trim_end_matches("/"), url.trim_start_matches("/"));
+
+        if let Some(query_params) = query_params {
+            let query_params = self.build_query(query_params);
+            let response = self.client.get(&url).query(&query_params).send().await?.json().await?;
+            Ok(response)
         }
-        if !query_string.is_empty() {
-            query_string.pop(); // Remove trailing '&'
-            url.push('?');
-            url.push_str(&query_string);
+        else {
+            let response = self.client.get(&url)
+                .query(&vec![("apikey".to_string(), self.config.auth.token.clone())])
+                .send().await?.json().await?;
+            Ok(response)
+        }
+        
+    }
+
+    pub async fn get_v4(&self, url: &str, query_params: Option<Vec<(String, String)>>) -> Result<Value, reqwest::Error> {
+        println!("Maiking request with query: {:?}", query_params);
+        let url = format!("{}/{}", self.base_url_v4.trim_end_matches("/"), url.trim_start_matches("/"));
+
+        if let Some(query_params) = query_params {
+            let query_params = self.build_query(query_params);
+            let response = self.client.get(&url).query(&query_params).send().await?.json().await?;
+            Ok(response)
+        }
+        else {
+            let response = self.client.get(&url)
+                .query(&vec![("apikey".to_string(), self.config.auth.token.clone())])
+                .send().await?.json().await?;
+            Ok(response)
         }
     }
-
-    if query_string.is_empty() {
-        url.push('?');
-    } else {
-        url.push('&');
-    }
-
-    url.push_str(&format!("apikey={}", apikey));
-
-    url
-}
-
-
-/// Makes a GET request to the specified api/v4 path with the given parameters.
-pub async fn make_request_2(path: &str, params: HashMap<String, Value>) -> Result<Value, reqwest::Error> {
-    let mut request_params = params;
-    request_params.insert("urlPath".to_string(), Value::String(path.to_string()));
-
-    let config = Config::new().expect("Could not read Configurations.");
-    let url = url_2(&request_params, config);
-
-    let client = reqwest::Client::new();
-    let response = client.get(&url).send().await?;
-    response.json::<Value>().await
 }
