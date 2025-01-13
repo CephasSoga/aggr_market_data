@@ -1,5 +1,6 @@
 
-
+//-----------------------TimeFrme---------------: START
+#[derive(Debug, Clone, Copy)]
 pub enum TimeFrame {
     OneMinute,
     FiveMinutes,
@@ -36,6 +37,10 @@ impl  TimeFrame {
     }
 }
 
+//-----------------------TimeFrme---------------: END
+
+//-----------------------DateTime---------------: START
+#[derive(Debug, Clone)]
 pub struct DateTime {
     pub year: String,
     pub month: String,
@@ -102,7 +107,11 @@ impl DateTime {
     }
 }
 
-#[derive(Clone, Copy)]
+//------------------DateTime---------------------: END
+
+
+//-----------------------FetchType---------------: START
+#[derive(Debug, Clone, Copy)]
 pub enum FetchType {
     Quote,
     Financial,
@@ -132,3 +141,45 @@ impl FetchType {
         }
     }
 }
+
+//------------------FetchType---------------------: END
+
+//-----------------------Either---------------: START
+/// Helper enum to handle single value or array of values.
+#[derive(Debug, Clone, Copy)]
+pub enum Either<L, R> {
+    Single(L),
+    Array(R),
+}
+impl Either<String, Vec<String>> 
+where
+    String: Clone,
+    Vec<String>: Clone,
+{
+    pub fn into_iter(self) -> Box<dyn Iterator<Item = String>> {
+        match self {
+            Either::Single(symbol) => Box::new(std::iter::once(symbol)),
+            Either::Array(symbols) => Box::new(symbols.into_iter()),
+        }
+    }
+
+    pub fn from_str(input: &str) -> Either<String, Vec<String>>{
+        let parts: Vec<&str> = input.split(',').map(|s| s.trim()).collect();
+        if parts.len() == 1 {
+            Either::Single(parts[0].to_string())
+        } else {
+            Either::Array(parts.into_iter().map(|s| s.to_string()).collect())
+        }
+    }
+
+    pub fn from_vec(input: Vec<String>) -> Either<String, Vec<String>> {
+        if input.len() == 1 {
+            Either::Single(input[0].clone())
+        } else {
+            Either::Array(input)
+        }
+    }
+}
+
+//------------------Either---------------------: END
+

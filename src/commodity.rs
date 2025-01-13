@@ -22,7 +22,7 @@ use crate::config::{RetryConfig, BatchConfig};
 use crate::options::{TimeFrame, DateTime, FetchType};
 use crate::cache::{Cache,  SharedLockedCache};
 
-const LIST_PATH: &str = "symbol/available-commodities";//"available-forex-currency-pairs";
+const LIST_PATH: &str = "symbol/available-commodities";
 const INTRADAY_PATH: &str = "historical-chart";
 const DAILY_PATH: &str = "historical-price-full";
 
@@ -60,15 +60,26 @@ pub struct CommodityPolling{
     http_client: Arc<HTTPClient>,
     cache: Arc<Mutex<SharedLockedCache>>,
     batch_config: Arc<BatchConfig>,
+    retry_config: Arc<RetryConfig>,
 }
 
 impl CommodityPolling {
     pub fn new(
         http_client: Arc<HTTPClient>,
         cache: Arc<Mutex<SharedLockedCache>>, 
-        batch_config: Arc<BatchConfig>
+        batch_config: Arc<BatchConfig>,
+        retry_config: Arc<RetryConfig>,
     ) -> Self {
-        Self {http_client,  cache, batch_config}
+        Self {http_client,  cache, batch_config, retry_config}
+    }
+
+    fn clone(&self) -> Self {
+        Self {
+            http_client: self.http_client.clone(),
+            cache: self.cache.clone(),
+            batch_config: self.batch_config.clone(),
+            retry_config: self.retry_config.clone(),
+        }
     }
 
     async fn get_cached_or_fetch<F: Future<Output = Result<Value, CommodityError>>>(
@@ -95,7 +106,7 @@ impl CommodityPolling {
         match result {
             Ok(value) => {
                 println!("Got value: {:?}", value);
-                cache.put(key.to_string(), (value.clone(), Instant::now()));
+                cache.put(key.to_string(), (value.clone(), Instant::now())).await;
                 Ok(value)
             }
             Err(e) => Err(CommodityError::FetchError(e.to_string())),
@@ -238,10 +249,7 @@ impl CommodityPolling {
             let batch = chunk.to_vec();
             let semaphore_clone = semaphore.clone();
 
-            let self_clone = Self::new(
-                self.http_client.clone(),
-                self.cache.clone(),
-                self.batch_config.clone());
+            let self_clone = self.clone();
 
             let fetch_type_clone = fetch_type.clone();
             let timeframe_clone = timeframe.to_string();

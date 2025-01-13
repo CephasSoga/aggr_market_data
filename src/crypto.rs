@@ -3,70 +3,92 @@
 #![allow(unused_variables)]
 
 
-use crate::request::{make_request, generate_json};
+use crate::request::HTTPClient;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use tokio::sync::Semaphore;
 use std::time::{Duration, Instant};
 use metrics::{counter, gauge};
 use tracing::{info, error};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use futures_util::Future;
-use std::fmt::Display;
-use lru::LruCache;
-use std::sync::Mutex;
+use thiserror::Error;
+use tokio::sync::Mutex;
 
-use crate::config::BatchConfig;
+use crate::utils::{retry, clone_str_options, clone_arc_refs};
+use crate::config::{RetryConfig, BatchConfig};
+use crate::cache::{Cache, SharedLockedCache};
+use crate::options::{TimeFrame, DateTime, FetchType};
 
-
+const LIST_PATH: &str = "available-forex-currency-pairs";
+const INTRADAY_PATH: &str = "history-chart";
+const DAILY_PATH: &str = "historical-price-full";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Crypto {
     pub symbol: String,
     pub name: String,
     pub currency: String,
-    pub stockExchange: String,
-    pub exchangeShortName: String,
+    pub stock_exchange: String,
+    pub exchange_short_name: String,
 }
 
-/// Helper enum to handle single value or array of values.
-pub enum Either<L, R> {
-    Single(L),
-    Array(R),
-}
-
-#[derive(Debug)]
+#[derive(Debug, Error, Serialize, Deserialize)]
 pub enum CryptoError {
+    #[error("Failed to fetch data: {0}")]
     FetchError(String),
+    
+    #[error("Task encountered an error: {0}")]
     TaskError(String),
+    
+    #[error("Failed to parse data: {0}")]
     ParseError(String),
+    
+    #[error("No tickers provided: {0}")]
     VoidTickersError(String),
-}
-impl Display for CryptoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
+
+    #[error("Invalid ticker: {0}")]
+    InvalidTicker(String),
+
+    #[error("Too many tickers: {0}")]
+    TooManyTickersError(String),
 }
 
 
 /// Functions for accessing cryptocurrency-related data from the FMP API
 pub struct CryptoPolling {
-    cache: Arc<tokio::sync::RwLock<HashMap<String, (Value, Instant)>>>,
-    batch_config: BatchConfig,
+    http_client: Arc<HTTPClient>,
+    cache: Arc<Mutex<SharedLockedCache>>,
+    batch_config: Arc<BatchConfig>,
+    retry_config: Arc<RetryConfig>
 }
 
 impl CryptoPolling {
-    pub fn new() -> Self {
+    pub fn new(
+        http_client: Arc<HTTPClient>, 
+        cache: Arc<Mutex<SharedLockedCache>>, 
+        batch_config: Arc<BatchConfig>,
+        retry_config: Arc<RetryConfig>
+    ) -> Self {
         Self {
-            cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            batch_config: BatchConfig::default(),
+            http_client,
+            cache,
+            batch_config,
+            retry_config,
         }
     }
 
-    pub async fn list() -> Result<Value, reqwest::Error> {
-        make_request("symbol/available-cryptocurrencies", HashMap::new()).await
+    pub async fn list(&self) -> Result<Value, reqwest::Error> {
+        self.http_client.get(LIST_PATH, None).await
+    }
+
+    fn normalize_symbol(symbol: &str) -> String {
+        let symbol = symbol.to_uppercase();
+        if !symbol.to_lowercase().contains("usd") {
+            format!("{}USD", symbol)
+        } else {
+            symbol
+        }
     }
 
     async fn get_from_cache_or_fetch<F, Fut>(
@@ -79,213 +101,224 @@ impl CryptoPolling {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Value, reqwest::Error>>,
     {
-        let mut cache = self.cache.write().await;
+        let mut cache = self.cache.lock().await;
 
         // Check cache
-        if let Some((value, timestamp)) = cache.get(key) {
+        if let Some((value, timestamp)) = cache.get(key).await {
             if timestamp.elapsed() < ttl {
                 return Ok(value.clone());
             } else {
-                cache.remove(key); // Expired
+                cache.pop(key); // Expired
             }
         }
 
         // Fetch and cache
         match fetch_fn().await {
             Ok(value) => {
-                cache.insert(key.to_string(), (value.clone(), Instant::now()));
+                cache.put(key.to_string(), (value.clone(), Instant::now())).await;
                 Ok(value)
             }
             Err(err) => Err(CryptoError::FetchError(err.to_string())),
         }
     }
 
-    fn normalize_symbol(symbol: &str) -> String {
-        let symbol = symbol.to_uppercase();
-        if !symbol.to_lowercase().contains("usd") {
-            format!("{}USD", symbol)
-        } else {
-            symbol
-        }
-    }
 
-    pub async fn quote(
+    pub async fn intraday(
         &self,
-        symbols: Option<Either<&str, &[&str]>>,
-        config: &BatchConfig,
-    ) -> Result<Value, CryptoError> {
-        match symbols {
-            Some(Either::Single(symbol)) => {
-                let normalized = Self::normalize_symbol(symbol);
-                let fetch_fn = || async {
-                    make_request("quote", generate_json(Value::String(normalized.clone()), None)).await
-                };
-                self.get_from_cache_or_fetch(&normalized, fetch_fn, config.cache_ttl).await
-            }
-            Some(Either::Array(symbols)) => {
-                let normalized: Vec<String> = symbols.iter().map(|s| Self::normalize_symbol(s)).collect();
-                let mut results = Vec::new();
-    
-                for symbol in &normalized {
-                    let fetch_fn = || async {
-                        make_request("quote", generate_json(Value::String(symbol.clone()), None)).await
-                    };
-                    let result = self.get_from_cache_or_fetch(symbol, fetch_fn, config.cache_ttl).await?;
-                    results.push(result);
-                }
-    
-                Ok(Value::Array(results))
-            }
-            None => make_request("cryptocurrencies", HashMap::new()).await.map_err(|e| CryptoError::FetchError(e.to_string())),
-        }
-    }
-    
-    pub async fn history(
-        &self,
-        symbols: Either<&str, &[&str]>,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-        data_type: Option<&str>,
-        limit: Option<i32>,
-        config: &BatchConfig,
-    ) -> Result<Value, CryptoError> {
-        let normalized = match symbols {
-            Either::Single(symbol) => Self::normalize_symbol(symbol),
-            Either::Array(symbols) => symbols.iter().map(|s| Self::normalize_symbol(s)).collect::<Vec<_>>().join(","),
-        };
-    
-        let cache_key = format!(
-            "history:{}:{}:{}:{}:{}",
-            normalized, start_date.unwrap_or(""), end_date.unwrap_or(""), data_type.unwrap_or(""), limit.unwrap_or(0)
-        );
-    
-        let fetch_fn = || async {
-            let query_params = json!({
-                "from": start_date,
-                "to": end_date,
-                "serietype": data_type,
-                "timeseries": limit
-            });
-    
-            make_request(
-                "historical-price-full/crypto",
-                generate_json(Value::String(normalized.clone()), Some(query_params)),
-            )
-            .await
-        };
-    
-        self.get_from_cache_or_fetch(&cache_key, fetch_fn, config.cache_ttl).await
-    }
-    
-    async fn process_batch(&self, batch: Vec<String>, config: &BatchConfig) -> Result<(), CryptoError> {
-        let start = Instant::now();
-        let mut rate_limiter = tokio::time::interval(Duration::from_secs_f32(
-            1.0 / config.rate_limit_per_second as f32
-        ));
+        symbol: &str, 
+        timeframe: &str, 
+        from: Option<&str>, 
+        to: Option<&str>
+    ) -> Result<Value, reqwest::Error> {
 
-        for symbol in batch {
-            rate_limiter.tick().await;
-            let mut attempts = 0;
-            while attempts < config.retry_attempts {
-                match self.fetch_crypto_data(&symbol, config).await {
-                    Ok(_) => {
-                        counter!("crypto.success").increment(1);
-                        break;
-                    }
-                    Err(e) => {
-                        attempts += 1;
-                        counter!("crypto.retries").increment(1);
-                        if attempts == config.retry_attempts {
-                            error!("Final retry failed for {}: {:?}", symbol, e);
-                            counter!("crypto.failures").increment(1);
-                        } else {
-                            tokio::time::sleep(Duration::from_millis(config.backoff_ms * attempts as u64)).await;
-                        }
-                    }
-                }
-            }
+        let symbol = Self::normalize_symbol(symbol);
+        let mut query_params = json!({});
+
+        if let Some(from) = from {
+            let from = DateTime::from_str(&from)
+                .expect("Invalid `from` date arguments")
+                .to_string();
+            query_params["from"] = json!(from);
+        }
+   
+        if let Some(to) = to {
+            let to = DateTime::from_str(&to)
+                .expect("Invalid `to` date arguments")
+                .to_string();
+            query_params["to"] = json!(to);
         }
         
-        gauge!("crypto.batch_duration", "rate limit" => format!("{}", start.elapsed().as_secs_f64()));
-        Ok(())
-    }
-
-    async fn fetch_crypto_data(&self, symbol: &str, config: &BatchConfig) -> Result<(), CryptoError> {
-        let (quote, history) = tokio::join!(
-            self.quote(Some(Either::Single(symbol)), config),
-            self.history(Either::Single(symbol), None, None, None, None, config)
-        );
-
-        quote.map_err(|e| CryptoError::FetchError(e.to_string()))?;
-        history.map_err(|e| CryptoError::FetchError(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn validate_tickers(tickers: Option<Vec<String>>) -> Result<Vec<String>, CryptoError> {
-        let cryptos = Self::list()
-            .await
-            .map_err(|e| CryptoError::FetchError(e.to_string()))?
-            .as_array()
-            .ok_or_else(|| CryptoError::ParseError("Invalid response format".to_string()))?
-            .iter()
-            .map(|c| serde_json::from_value(c.clone()))
-            .collect::<Result<Vec<Crypto>, _>>()
-            .map_err(|e| CryptoError::ParseError(e.to_string()))?;
-
-        let available_symbols: HashSet<_> = cryptos.iter().map(|c| c.symbol.clone()).collect();
-        match tickers {
-            Some(input_symbols) => {
-                let invalid_symbols: Vec<_> = input_symbols
-                    .iter()
-                    .filter(|s| !available_symbols.contains(*s))
-                    .cloned()
-                    .collect();
-                
-                if invalid_symbols.is_empty() {
-                    Ok(input_symbols)
-                } else {
-                    Err(CryptoError::ParseError(format!(
-                        "Invalid ticker symbols: {:?}",
-                        invalid_symbols
-                    )))
-                }
-            }
-            None => Err(CryptoError::VoidTickersError("No tickers provided".to_string())),
-        }
-    }
-
-    pub async fn poll(&self, tickers: Option<Vec<String>>) -> Result<(), CryptoError> {
-        let config = self.batch_config.clone();
+        let query_params = self.http_client.build_query_from_value(query_params);
+        let timeframe_value = TimeFrame::from_str(&timeframe)
+            .unwrap_or(TimeFrame::FiveMinutes);
+        let timeframe = timeframe_value.to_str();
+        let path = self.http_client.join(vec![INTRADAY_PATH, timeframe, &symbol]);
+        self.http_client.get(
+            path.as_str(), 
+            Some(query_params))
+        .await
         
-        let symbols = Self::validate_tickers(tickers).await?;
+    }
 
-        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
+    pub async fn daily(&self, symbol: &str) -> Result<Value, reqwest::Error> {
+        let symbol = Self::normalize_symbol(symbol);
+        let path = self.http_client.join(vec![DAILY_PATH, &symbol]);
+        self.http_client.get(&path, None).await
+    }
+    
+    async fn ticker_level_concurrency(
+        &self, 
+        batch: Vec<String>,
+        fetch_type: FetchType,
+        timeframe: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Value {
+        if batch.is_empty() {
+            return Value::Null;
+        }
+    
         let mut tasks = vec![];
-
-        for chunk in symbols.chunks(config.batch_size) {
-            let batch = chunk.to_vec();
-            let semaphore_clone = semaphore.clone();
-            let config_clone = config.clone();
-
-            let self_clone = Self::new();
+    
+        for symbol in batch {
+            let retry_config_clone = self.retry_config.clone();
+            let (timeframe, from, to) = clone_str_options((&timeframe, &from, &to));
+            let symbol_clone = symbol.clone();
+            let self_clone = self.clone();
+    
             let task = tokio::spawn(async move {
-                let _permit = semaphore_clone.acquire().await
-                    .map_err(|e| CryptoError::TaskError(e.to_string()))?;
-                self_clone.process_batch(batch, &config_clone).await
+                
+                retry(&retry_config_clone, || async {
+                    self_clone.fetch_crypto_data(&symbol_clone, fetch_type, timeframe.as_deref(), from.as_deref(), to.as_deref()).await
+                }).await
             });
             tasks.push(task);
         }
+    
+        let results: Vec<_> = futures::future::join_all(tasks).await;
+        let mut values = vec![];
 
-        for task in tasks {
-            match task.await {
-                Ok(result) => if let Err(e) = result {
-                    error!("Batch processing error: {:?}", e);
-                },
-                Err(e) => error!("Task failure: {:?}", e),
+        for result in results {
+            match result {
+                Ok(Ok(value)) => values.push(value),
+                Ok(Err(e)) => {
+                    error!("Failed to fetch data: {:?}", e);
+                    values.push(json!({"error": e.to_string()}));
+                }
+                Err(e) => {
+                    error!("Task panicked: {:?}", e);
+                    values.push(json!({"error": "Task panicked"}));
+                }
             }
         }
 
-        Ok(())
+        serde_json::json!(values)
+    }
+    
+    fn clone(&self) -> Self {
+        Self {
+            http_client: self.http_client.clone(),
+            cache: self.cache.clone(),
+            batch_config: self.batch_config.clone(),
+            retry_config: self.retry_config.clone(),
+        }
+    }
+
+    async fn fetch_crypto_data(
+        &self, 
+        symbol: &str, 
+        fetch_type: FetchType,
+        timeframe: Option<&str>, 
+        from: Option<&str>,
+        to: Option<&str>
+    ) -> Result<Value, CryptoError> {
+        match fetch_type {
+            FetchType::IntraDay => self.intraday(
+                symbol, timeframe.unwrap_or(TimeFrame::FiveMinutes.to_str()), 
+                from, to).await
+            .map_err(|err| CryptoError::FetchError(err.to_string())),
+            FetchType::Daily => self.daily(symbol)
+            .await
+            .map_err(|err| CryptoError::FetchError(err.to_string())),
+            _ => Err(CryptoError::TaskError(format!("Invalid fecth type: {:?}", fetch_type))),
+        }
+    }
+
+    async fn validate_tickers(&self, tickers: Vec<String>) -> Result<Vec<String>, CryptoError> {
+        if tickers.len() > self.batch_config.batch_size {
+            return Err(CryptoError::TooManyTickersError(format!("Too many tickers: {}", tickers.len())));
+        } else if tickers.is_empty() {
+            return Err(CryptoError::VoidTickersError("No tickers provided".to_string()));
+        }
+        Ok(tickers)
+    }
+
+    pub async fn batch_level_concurrency(
+        &self, 
+        tickers: Vec<String>,
+        fetch_type: FetchType,
+        timeframe: Option<String>,
+        from: Option<String>,
+        to: Option<String>
+    ) -> Result<Value, CryptoError> {
+        let config = self.batch_config.clone();
+        
+        let symbols = self.validate_tickers(tickers).await?;
+    
+        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
+        let mut tasks = vec![];
+    
+        for chunk in symbols.chunks(config.batch_size) {
+            let batch = chunk.to_vec();
+            let (batc_config, semaphore, retry_config) = clone_arc_refs((&self.batch_config, &semaphore, &self.retry_config));
+            let (timeframe, from, to) = clone_str_options((&timeframe, &from, &to));
+
+    
+            let self_clone = self.clone();
+            let task = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await
+                    .map_err(|e| CryptoError::TaskError(e.to_string()));
+                self_clone.ticker_level_concurrency(batch, fetch_type, timeframe, from, to).await
+            });
+            tasks.push(task);
+        }
+    
+        let results: Vec<_> = futures_util::future::join_all(tasks).await;
+        let mut values = vec![];
+    
+        for result in results {
+            match result {
+                Ok(value) => values.push(value),
+                Err(e) => {
+                    error!("Task failure: {:?}", e);
+                    values.push(json!({"error": "Task panicked"}));
+                }
+            }
+        }
+    
+        Ok(Value::Array(values))
+    }
+
+    pub async fn poll(&self, value: &Value) -> Result<Value, CryptoError> {
+        let tickers = value.get("tickers")
+        .and_then(Value::as_array)
+        .ok_or(CryptoError::ParseError("Missing 'tickers' field".to_string()))?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(Self::normalize_symbol)
+        .collect::<Vec<String>>();
+
+    let fetch_type_str = value.get("fetch_type")
+        .and_then(Value::as_str)
+        .ok_or(CryptoError::ParseError("Missing 'fetch_type' field".to_string()))?;
+
+    let fetch_type = FetchType::from_str(fetch_type_str);
+
+    let timeframe = value.get("timeframe").and_then(Value::as_str).map(String::from);
+    let from = value.get("from").and_then(Value::as_str).map(String::from);
+    let to = value.get("to").and_then(Value::as_str).map(String::from);
+    
+    self.batch_level_concurrency(tickers, fetch_type, timeframe, from, to).await
     }
 }
 

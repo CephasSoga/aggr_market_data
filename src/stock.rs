@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::utils::{retry, clone_str_options, clone_arc_refs};
 use crate::config::{RetryConfig, BatchConfig};
 use crate::cache::{Cache, SharedCache, SharedLockedCache};
 
@@ -37,10 +38,6 @@ const CURRENT_PRICE_PATH: &str = "real-time-price";
 const HISTORY_PATH: &str = "historical-price-full";
 const SPLIT_HISTORY_PATH: &str = "stock_split";
 const DIVIDEND_HISTORY_PATH: &str = "stock_dividend";
-
-pub trait FunctionArgs {
-    fn expected_args() -> Vec<&'static str>;
-}
 
 #[derive(Clone, Copy)]
 pub enum FetchType {
@@ -101,20 +98,33 @@ pub enum StockError {
 
 /// Functions for accessing stock-related data from the FMP API.
 pub struct StockPolling {
+    http_client: Arc<HTTPClient>,
    cache: Arc<Mutex<SharedLockedCache>>,
    batch_config: Arc<BatchConfig>,
-   http_client: Arc<HTTPClient>,
+   retry_config: Arc<RetryConfig>,
 }
 
 impl StockPolling {
     pub fn new(
-        cache: Arc<Mutex<SharedLockedCache>>, 
-        batch_config:Arc<BatchConfig>, 
-        http_client: Arc<HTTPClient>) -> Self {
+        http_client: Arc<HTTPClient>,
+        cache: Arc<Mutex<SharedLockedCache>>,  
+        batch_config:Arc<BatchConfig>,
+        retry_config: Arc<RetryConfig>
+    ) -> Self {
         Self {
+            http_client,
             cache,
             batch_config,
-            http_client,
+            retry_config
+        }
+    }
+
+    fn clone(&self) -> Self {
+        Self {
+            http_client: self.http_client.clone(),
+            cache: self.cache.clone(),
+            batch_config: self.batch_config.clone(),
+            retry_config: self.retry_config.clone(),
         }
     }
 
@@ -341,7 +351,7 @@ impl StockPolling {
         }
     }
     
-    async fn process_batch(
+    async fn ticker_level_concurrency(
         &self,
         tickers: Vec<String>,
         fetch_type: FetchType,
@@ -363,11 +373,7 @@ impl StockPolling {
         let http_client_clone = Arc::clone(&self.http_client);
 
         // Shared self
-        let shared_self = Arc::new(Self::new(
-            cache_clone, 
-            config_clone, 
-            http_client_clone
-        ));
+        let shared_self = Arc::new(self.clone());
     
         for ticker in tickers {
             let permit = semaphore.clone().acquire_owned().await.unwrap(); // Acquire semaphore permit
@@ -431,7 +437,7 @@ impl StockPolling {
 
    
 
-    async fn poll_(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<Value, StockError> {
+    async fn batch_level_concurrency(&self, tickers: Vec<String>, fetch_type: FetchType) -> Result<Value, StockError> {
         let config = Arc::clone(&self.batch_config);
 
         let tickers = self.validate_tickers(tickers).await?;
@@ -445,12 +451,12 @@ impl StockPolling {
             let cache_clone = Arc::clone(&self.cache);
             let http_client_clone = Arc::clone(&self.http_client);
 
-            let self_clone = Self::new(cache_clone, config.clone(), http_client_clone);
+            let self_clone = self.clone();
 
             let future = tokio::spawn({
                 async move {
                     let _permit = semaphore.acquire().await.unwrap();
-                    let value= self_clone.process_batch(batch, fetch_type).await;
+                    let value= self_clone.ticker_level_concurrency(batch, fetch_type).await;
                     drop(_permit);
                     value
                 }
@@ -489,12 +495,7 @@ impl StockPolling {
 
     let fetch_type = FetchType::from_str(fetch_type_str);
     
-    self.poll_(tickers, fetch_type).await
+    self.batch_level_concurrency(tickers, fetch_type).await
     }
 }
 
-impl FunctionArgs for fn(Value) -> Result<(), StockError> {
-    fn expected_args() -> Vec<&'static str> {
-        vec!["tickers", "fetch_type"]
-    }
-}
