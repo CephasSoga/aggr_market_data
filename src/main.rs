@@ -1,6 +1,6 @@
 pub mod cache;
 pub mod config;
-//pub mod commodity;
+pub mod commodity;
 //pub mod crypto;
 //pub mod etf;
 pub mod financial;
@@ -16,10 +16,12 @@ pub mod stock;
 pub mod websocket;
 pub mod utils;
 pub mod request_parser;
+pub mod options;
 
 use tokio;
 
 use crate::stock::StockPolling;
+use crate::commodity::CommodityPolling;
 use crate::cache::SharedLockedCache;
 use crate::request::HTTPClient;
 use config::BatchConfig;
@@ -33,8 +35,8 @@ async fn main() {
     let cache = Arc::new(Mutex::new(SharedLockedCache::new(1000)));
     let config = Arc::new(BatchConfig::default());
     let http_client = Arc::new(HTTPClient::new().expect("Failed to create HTTP client"));
-    let stock_polling = StockPolling::new(cache, config, http_client);
+    let stock_polling = CommodityPolling::new( http_client, cache, config);
 
-    let r = stock_polling.split_history("AAPL").await;
+    let r = stock_polling.intraday("HEUSX", "5min", None, None).await;
     println!("{:?}", r);
 }
