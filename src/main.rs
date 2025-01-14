@@ -8,9 +8,9 @@ pub mod commodity;
 pub mod crypto;
 //pub mod etf;
 pub mod financial;
-//pub mod forex;
+pub mod forex;
 //pub mod index;
-//pub mod market;
+pub mod market;
 //pub mod mutualfund;
 pub mod request;
 //pub mod search;
@@ -29,6 +29,8 @@ use tokio;
 use crate::stock::StockPolling;
 use crate::commodity::CommodityPolling;
 use crate::crypto::CryptoPolling;
+use crate::forex::ForexPolling;
+use crate::market::MarketPolling;
 use crate::cache::SharedLockedCache;
 use crate::request::HTTPClient;
 use config::{BatchConfig, RetryConfig};
@@ -43,11 +45,11 @@ async fn main() {
     let batch_config = Arc::new(BatchConfig::default());
     let retry_config = Arc::new(RetryConfig::default());
     let http_client = Arc::new(HTTPClient::new().expect("Failed to create HTTP client"));
-    let polling = StockPolling::new( http_client, cache, batch_config, retry_config);
+    let polling = MarketPolling::new( http_client, cache, batch_config, retry_config);
 
     let r = polling.poll(&json!({
-        "tickers": ["BTCUSD", "ETHUSD"],
-        "fetch_type": "intraday",
+        //"tickers": ["EURUSD", "MYREUR"],
+        "fetch_type": "sector_pe_ratio",
     })).await;
     println!("{:?}", r);
 }

@@ -4,34 +4,78 @@
 
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use futures_util::Future;
 use metrics::{counter, gauge};
 use tracing::{info, error};
 use tokio::sync::Semaphore;
-use crate::config::BatchConfig;
-use serde_json::Value;
-use crate::request::make_request;
+use tokio::sync::Mutex;
+use serde_json::{json, Value};
+use thiserror::Error;
 
-#[derive(Debug)]
+use crate::request::HTTPClient;
+use crate::config::{RetryConfig, BatchConfig};
+use crate::cache::{Cache, SharedLockedCache};
+use crate::options::{TimeFrame, DateTime, FetchType};
+use crate::utils::{clone_arc_refs, clone_str_options, retry, now};
+
+const GAINERS_PATH: &str = "stock_market/gainers";
+const LOSERS_PATH: &str = "stock_market/losers";
+const ACTIVES_PATH: &str = "stock_market/active";
+const PERFORMANCE_PATH: &str = "sector-performance";
+const HISTORICAL_PERFORMANCE_PATH: &str = "historical-sectors-performance";
+const SECTOR_PRICE_EARNING_RATIO_PATH: &str = "sector_price_earning_ratio"; //V4 only
+const INDUSTRY_PRICE_EARNING_RATIO_PATH: &str = "industry_price_earning_ratio"; //V4 only
+
+#[derive(Debug, Error)]
 pub enum MarketError {
+    #[error("Failed to fetch data: {0}")]
     FetchError(String),
+    
+    #[error("Task encountered an error: {0}")]
     TaskError(String),
-    CacheError(String),
+    
+    #[error("Failed to parse data: {0}")]
+    ParseError(String),
+    
+    #[error("No tickers provided: {0}")]
+    VoidTickersError(String),
+
+    #[error("Invalid ticker: {0}")]
+    InvalidTicker(String),
+
+    #[error("Too many tickers: {0}")]
+    TooManyTickersError(String),
 }
 
 pub struct MarketPolling {
-    cache: Arc<RwLock<HashMap<String, (Value, Instant)>>>,
-    batch_config: BatchConfig,
+    http_client: Arc<HTTPClient>,
+    cache: Arc<Mutex<SharedLockedCache>>,
+    batch_config: Arc<BatchConfig>,
+    retry_config: Arc<RetryConfig>,
 }
 
 impl MarketPolling {
-    pub fn new() -> Self {
+    pub fn new(
+        http_client: Arc<HTTPClient>, 
+        cache: Arc<Mutex<SharedLockedCache>>, 
+        batch_config: Arc<BatchConfig>, 
+        retry_config: Arc<RetryConfig>) -> Self {
         Self {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            batch_config: BatchConfig::default(),
+            http_client,
+            cache,
+            batch_config,
+            retry_config,
+        }
+    }
+
+    fn clone(&self) -> Self {
+        Self {
+            http_client: self.http_client.clone(),
+            cache: self.cache.clone(),
+            batch_config: self.batch_config.clone(),
+            retry_config: self.retry_config.clone(),
         }
     }
 
@@ -43,115 +87,172 @@ impl MarketPolling {
     ) -> Result<Value, MarketError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Value, reqwest::Error>>,
+        Fut: Future<Output = Result<Value, MarketError>>,
     {
-        let mut cache = self.cache.write().await;
-        if let Some((value, timestamp)) = cache.get(key) {
+        let mut cache = self.cache.lock().await;
+        if let Some((value, timestamp)) = cache.get(key).await {
             if timestamp.elapsed() < ttl {
                 return Ok(value.clone());
             }
-            cache.remove(key);
+            cache.pop(key);
         }
 
         match fetch_fn().await {
             Ok(value) => {
-                cache.insert(key.to_string(), (value.clone(), Instant::now()));
+                cache.put(key.to_string(), (value.clone(), Instant::now()));
                 Ok(value)
             }
             Err(err) => Err(MarketError::FetchError(err.to_string())),
         }
     }
 
-    async fn fetch_market_data(&self, endpoint: &str) -> Result<Value, MarketError> {
-        let cache_key = format!("market_{}", endpoint);
-        
-        self.get_from_cache_or_fetch(
-            &cache_key,
-            || async {
-                make_request(endpoint, HashMap::new()).await
+    async fn fetch_market_data(
+        &self, 
+        fetch_type: FetchType, 
+        date: Option<String>, 
+        from: Option<String>, 
+        to: Option<String>,
+        exchange: Option<String>, 
+        limit: Option<u32>
+    ) -> Result<Value, MarketError> {
+        match fetch_type {
+            FetchType::Gainers => {
+                let key = "market_gainers";
+                let ttl = self.batch_config.cache_ttl;
+                let op = self.most_gainer();
+                self.get_from_cache_or_fetch(key, || async { op.await }, ttl).await
             },
-            Duration::from_secs(60), // 1 minute cache
-        ).await
-    }
-
-    pub async fn most_active(&self) -> Result<Value, MarketError> {
-        self.fetch_market_data("most_active").await
-    }
-
-    pub async fn most_gainer(&self) -> Result<Value, MarketError> {
-        self.fetch_market_data("most_gainer").await
-    }
-
-    pub async fn most_loser(&self) -> Result<Value, MarketError> {
-        self.fetch_market_data("most_loser").await
-    }
-
-    pub async fn sector_performance(&self) -> Result<Value, MarketError> {
-        self.fetch_market_data("sector-performance").await
-    }
-
-    async fn process_batch(&self, endpoints: Vec<&str>, config: &BatchConfig) -> Result<(), MarketError> {
-        let start = Instant::now();
-        let mut rate_limiter = tokio::time::interval(Duration::from_secs_f32(
-            1.0 / config.rate_limit_per_second as f32
-        ));
-
-        for endpoint in endpoints {
-            rate_limiter.tick().await;
-            let mut attempts = 0;
-            while attempts < config.retry_attempts {
-                match self.fetch_market_data(endpoint).await {
-                    Ok(_) => {
-                        counter!("market.success").increment(1);
-                        break;
-                    }
-                    Err(e) => {
-                        attempts += 1;
-                        counter!("market.retries").increment(1);
-                        if attempts == config.retry_attempts {
-                            error!("Final retry failed for {}: {:?}", endpoint, e);
-                            counter!("market.failures").increment(1);
-                        } else {
-                            tokio::time::sleep(Duration::from_millis(config.backoff_ms * attempts as u64)).await;
-                        }
-                    }
-                }
-            }
+            FetchType::Losers => {
+                let key = "market_losers";
+                let ttl = self.batch_config.cache_ttl;
+                let op = self.most_loser();
+                self.get_from_cache_or_fetch(key, || async { op.await }, ttl).await
+            },
+            FetchType::Actives => {
+                let key = "market_actives";
+                let ttl = self.batch_config.cache_ttl;
+                let op = self.most_active();
+                self.get_from_cache_or_fetch(key, || async { op.await }, ttl).await
+            },
+            FetchType::Performance => {
+                let key = "market_performance";
+                let ttl = self.batch_config.cache_ttl;
+                let op = self.sector_performance();
+                self.get_from_cache_or_fetch(key, || async { op.await }, ttl).await
+            },
+            FetchType::SectorHistorical => {
+                let key = "market_sector_historical";
+                let ttl = self.batch_config.cache_ttl;
+                let op = self.historical_sector_performance(from, to, limit);
+                self.get_from_cache_or_fetch(key, || async { op.await }, ttl).await
+            },
+            FetchType::SectorPERatio => {
+                let key = format!("market_sector_peratio/{}", exchange.clone().unwrap_or("".to_string()));
+                let ttl = self.batch_config.cache_ttl;
+                let date = &date.unwrap_or(now().split(" ").next().unwrap().to_string());
+                let op =self.sector_price_earning_ratio(date, exchange);
+                self.get_from_cache_or_fetch(&key, || async { op.await }, ttl).await
+            },
+            FetchType::IndustryPERatio => {
+                let date = &date.unwrap_or(now().split(" ").next().unwrap().to_string());
+                let key = format!("market_industry_peratio/{}", exchange.clone().unwrap_or("".to_string()));
+                let ttl = self.batch_config.cache_ttl;
+                let op = self.industry_price_earning_ratio(date, exchange);
+                self.get_from_cache_or_fetch(&key, || async { op.await }, ttl).await
+            },
+            _ => Err(MarketError::TaskError("Invalid fetch type".to_string())),
         }
-        
-        gauge!("market.batch_duration", "rate_limit" => format!("{}", start.elapsed().as_secs_f64()));
-        Ok(())
     }
 
-    pub async fn poll(&self) -> Result<(), MarketError> {
-        let config = self.batch_config.clone();
-        let endpoints = vec!["most_active", "most_gainer", "most_loser", "sector_performance"];
-        
-        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
-        let tasks = endpoints.chunks(config.batch_size)
-            .map(|chunk| {
-                let batch = chunk.to_vec();
-                let semaphore_clone = semaphore.clone();
-                let config_clone = config.clone();
-                let self_clone = Self::new();
 
-                tokio::spawn(async move {
-                    let _permit = semaphore_clone.acquire().await
-                        .map_err(|e| MarketError::TaskError(e.to_string()))?;
-                    self_clone.process_batch(batch, &config_clone).await
-                })
-            })
-            .collect::<Vec<_>>();
+    async fn most_active(&self) -> Result<Value, MarketError> {
+        self.http_client.get(ACTIVES_PATH, None)
+            .await
+            .map_err(|e| MarketError::FetchError(e.to_string()))
+    }
 
-        for task in tasks {
-            match task.await {
-                Ok(result) => if let Err(e) = result {
-                    error!("Batch processing error: {:?}", e);
-                },
-                Err(e) => error!("Task failure: {:?}", e),
-            }
-        }
+    async fn most_gainer(&self) -> Result<Value, MarketError> {
+        self.http_client.get(GAINERS_PATH, None)
+            .await
+            .map_err(|e| MarketError::FetchError(e.to_string()))
+    }
 
-        Ok(())
+    async fn most_loser(&self) -> Result<Value, MarketError> {
+        self.http_client.get(LOSERS_PATH, None)
+            .await
+            .map_err(|e| MarketError::FetchError(e.to_string()))
+    }
+
+    async fn sector_performance(&self) -> Result<Value, MarketError> {
+        self.http_client.get(PERFORMANCE_PATH, None)
+            .await
+            .map_err(|e| MarketError::FetchError(e.to_string()))
+    }
+
+    async fn historical_sector_performance(&self, from: Option<String>, to: Option<String>, limit: Option<u32>) -> Result<Value, MarketError> {
+        let query_params = json!({
+            "from": from,
+            "to": to,
+            "limit": limit
+        });
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get(HISTORICAL_PERFORMANCE_PATH, Some(query_params))
+            .await
+            .map_err(|e| MarketError::FetchError(e.to_string()))
+    }
+
+    async fn sector_price_earning_ratio(&self, date: &str, exchange: Option<String>) -> Result<Value, MarketError> {
+        let query_params = json!({
+            "date": date,
+            "exchange": exchange
+        });
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get_v4(SECTOR_PRICE_EARNING_RATIO_PATH, Some(query_params))
+            .await
+            .map_err(|e| MarketError::FetchError(e.to_string()))
+    }
+
+    async fn industry_price_earning_ratio(&self, date: &str, exchange: Option<String>) -> Result<Value, MarketError> {
+        let query_params = json!({
+            "date": date,
+            "exchange": exchange
+        });
+        let query_params = self.http_client.build_query_from_value(query_params);
+        self.http_client.get_v4(INDUSTRY_PRICE_EARNING_RATIO_PATH, Some(query_params))
+            .await
+            .map_err(|e| MarketError::FetchError(e.to_string()))
+    }
+
+
+
+    pub async fn poll(&self, value: &Value) -> Result<Value, MarketError> {
+        let fetch_type = value.get("fetch_type")
+            .and_then(Value::as_str)
+            .map(FetchType::from_str)
+            .ok_or(MarketError::ParseError("Fetch type not defined".to_string()))?;
+
+        let date = value.get("date")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+
+        let from = value.get("from")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        let to = value.get("to")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        let exchange = value.get("exchange")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        let limit = value.get("limit")
+            .and_then(Value::as_u64)
+            .map(|limit| limit as u32);
+
+        self.fetch_market_data(fetch_type, date, from, to, exchange, limit)
+           .await
     }
 }

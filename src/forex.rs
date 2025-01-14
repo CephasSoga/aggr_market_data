@@ -5,9 +5,7 @@
 use std::clone;
 use std::collections::HashMap;
 
-use crate::request::{make_request, generate_json};
-use crate::financial::Financial;
-use serde::de::value;
+use crate::request::HTTPClient;
 use tokio::time::sleep;
 use serde_json::{json, to_value, Value};
 use tokio::sync::Semaphore;
@@ -16,22 +14,21 @@ use metrics::{counter, gauge};
 use tracing::{info, error};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+
 use futures_util::Future;
-use std::fmt::Display;
-use lru::LruCache;
 use tokio::sync::Mutex;
 use thiserror::Error;
 
+use crate::utils::{retry, clone_str_options, clone_arc_refs};
 use crate::config::{RetryConfig, BatchConfig};
+use crate::cache::{Cache, SharedLockedCache};
+use crate::options::{DateTime, TimeFrame, FetchType};
 
-#[derive(Debug, Clone)]
-pub enum FetchType {
-    List,
-    Rate,
-    Historical
+const LIST_PATH: &str = "symbol/available-forex-currency-pairs";
+const INTRADAY_PATH: &str = "history-chart";
+const DAILY_PATH: &str = "historical-price-full";
 
-}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Forex{
@@ -55,255 +52,274 @@ pub enum ForexError {
     
     #[error("No tickers provided: {0}")]
     VoidTickersError(String),
+
+    #[error("Invalid ticker: {0}")]
+    InvalidTicker(String),
+
+    #[error("Too many tickers: {0}")]
+    TooManyTickersError(String),
 }
 
 /// Functions for accessing foreign exchange rate data from the FMP API.
 pub struct ForexPolling {
-    cache: Arc<Mutex<LruCache<String, (Value, Instant)>>>,
+    http_client: Arc<HTTPClient>,
+    cache: Arc<Mutex<SharedLockedCache>>,
     retry_config: Arc<RetryConfig>, //RetryConfig,
     batch_config: Arc<BatchConfig>,
-    semaphore: Arc<Mutex<Semaphore>>,
 }
 
 impl ForexPolling {
-    pub fn new() -> Self {
-        let retry_config = Arc::new(RetryConfig::default());
-        let batch_config = Arc::new(BatchConfig::default());
+    pub fn new(http_client: Arc<HTTPClient>, cache: Arc<Mutex<SharedLockedCache>>, batch_config: Arc<BatchConfig>, retry_config: Arc<RetryConfig>) -> Self {
+
         Self { 
-            cache: Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))),
-            retry_config: Arc::clone(&retry_config),
-            batch_config: Arc::clone(&batch_config),
-            semaphore: Arc::new(Mutex::new(Semaphore::new(retry_config.rate_limit_per_second as usize))),
+            http_client,
+            cache,
+            batch_config,
+            retry_config
         }
     }
 
-    pub async fn list(&self) -> Result<Value, ForexError> {
-        let cahe_key = "forex/list";
-
-        let fetch_fn = async {
-            make_request("symbol/available-forex-currency-pairs", HashMap::new())
-            .await
-            .map_err(|e| ForexError::FetchError(format!("Failed to fetch forex list: {}", e.to_string())))
-        };
-        self.get_cached_or_fetch(&cahe_key, fetch_fn).await
+    pub fn clone(&self) -> Self {
+        Self {
+            http_client: self.http_client.clone(),
+            cache: self.cache.clone(),
+            batch_config: self.batch_config.clone(),
+            retry_config: self.retry_config.clone(),
+        }
     }
 
-    pub async fn get_cached_or_fetch<F: Future<Output = Result<Value, ForexError>>>(
-        &self, 
-        key: &str, 
-        fetch_fn: F
-    ) -> Result<Value, ForexError> 
-    where F: Future<Output = Result<Value, ForexError>> {
+    pub async fn list(&self) -> Result<Value, reqwest::Error> {
+        self.http_client.get(LIST_PATH, None).await
+    }
+
+    fn normalize_symbol(symbol: &str) -> String {
+        let symbol = symbol.to_uppercase();
+        if !symbol.to_lowercase().contains("usd") {
+            format!("{}USD", symbol)
+        } else {
+            symbol
+        }
+    }
+
+    async fn get_from_cache_or_fetch<F, Fut>(
+        &self,
+        key: &str,
+        fetch_fn: F,
+        ttl: Duration,
+    ) -> Result<Value, ForexError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, reqwest::Error>>,
+    {
         let mut cache = self.cache.lock().await;
-        if let Some((value, instant)) = cache.get(key) {
-            if instant.elapsed() < Duration::from_secs(60) {
+
+        // Check cache
+        if let Some((value, timestamp)) = cache.get(key).await {
+            if timestamp.elapsed() < ttl {
                 return Ok(value.clone());
             } else {
-                cache.pop(key);// Expired
+                cache.pop(key); // Expired
             }
         }
 
-        // Fetch data and store in cache
-        let result = fetch_fn.await;
-        match result {
+        // Fetch and cache
+        match fetch_fn().await {
             Ok(value) => {
-                cache.put(key.to_string(), (value.clone(), Instant::now()));
+                cache.put(key.to_string(), (value.clone(), Instant::now())).await;
                 Ok(value)
-            },
-            Err(e) => Err(ForexError::FetchError(e.to_string())),
+            }
+            Err(err) => Err(ForexError::FetchError(err.to_string())),
         }
     }
 
-    pub async fn rate(&self, from_and_to: (&str, &str)) -> Result<Value, ForexError> {
-        let (from_curr, to_curr) = from_and_to;
-        let symbol = format!("{}{}", from_curr, to_curr);
 
-        let cache_key = format!("rate/{}", symbol);
+    pub async fn intraday(
+        &self,
+        symbol: &str, 
+        timeframe: &str, 
+        from: Option<&str>, 
+        to: Option<&str>
+    ) -> Result<Value, reqwest::Error> {
 
-        let fecth_fn = async {
-            make_request(
-                "quote",
-                generate_json(Value::String(symbol), None)
-            ).await
-            .map_err(|e| ForexError::FetchError(e.to_string()))
-        };
+        let symbol = Self::normalize_symbol(symbol);
+        let mut query_params = json!({});
 
-        self.get_cached_or_fetch(&cache_key, fecth_fn).await
-
+        if let Some(from) = from {
+            let from = DateTime::from_str(&from)
+                .expect("Invalid `from` date arguments")
+                .to_string();
+            query_params["from"] = json!(from);
+        }
+   
+        if let Some(to) = to {
+            let to = DateTime::from_str(&to)
+                .expect("Invalid `to` date arguments")
+                .to_string();
+            query_params["to"] = json!(to);
+        }
+        
+        let query_params = self.http_client.build_query_from_value(query_params);
+        let timeframe_value = TimeFrame::from_str(&timeframe)
+            .unwrap_or(TimeFrame::FiveMinutes);
+        let timeframe = timeframe_value.to_str();
+        let path = self.http_client.join(vec![INTRADAY_PATH, timeframe, &symbol]);
+        self.http_client.get(
+            path.as_str(), 
+            Some(query_params))
+        .await
+        
     }
 
-    pub async fn history(
-        &self,
-        from_and_to: (&str, &str),
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-        data_type: Option<&str>,
-        limit: Option<i32>,
-    ) -> Result<Value, ForexError> {
-        let (from_curr, to_curr) = from_and_to;
-        let symbol = format!("{}{}", from_curr, to_curr);
-
-        let cache_key = format!("history/{}", symbol);
-
-        let fetch_fn = async {
-            let query_params = json!({
-                "from": start_date,
-                "to": end_date,
-                "serietype": data_type,
-                "timeseries": limit
+    pub async fn daily(&self, symbol: &str) -> Result<Value, reqwest::Error> {
+        let symbol = Self::normalize_symbol(symbol);
+        let path = self.http_client.join(vec![DAILY_PATH, &symbol]);
+        self.http_client.get(&path, None).await
+    }
+    
+    async fn ticker_level_concurrency(
+        &self, 
+        batch: Vec<String>,
+        fetch_type: FetchType,
+        timeframe: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Value {
+        if batch.is_empty() {
+            return Value::Null;
+        }
+    
+        let mut tasks = vec![];
+    
+        for symbol in batch {
+            let retry_config_clone = self.retry_config.clone();
+            let (timeframe, from, to) = clone_str_options((&timeframe, &from, &to));
+            let symbol_clone = symbol.clone();
+            let self_clone = self.clone();
+    
+            let task = tokio::spawn(async move {
+                
+                retry(&retry_config_clone, || async {
+                    self_clone.fetch_crypto_data(&symbol_clone, fetch_type, timeframe.as_deref(), from.as_deref(), to.as_deref()).await
+                }).await
             });
+            tasks.push(task);
+        }
+    
+        let results: Vec<_> = futures::future::join_all(tasks).await;
+        let mut values = vec![];
 
-            make_request(
-                "historical-price-full/forex",
-                generate_json(Value::String(symbol), Some(query_params))
-            ).await
-            .map_err(|e| ForexError::FetchError(e.to_string()))
-        };
-        self.get_cached_or_fetch(&cache_key, fetch_fn).await
+        for result in results {
+            match result {
+                Ok(Ok(value)) => values.push(value),
+                Ok(Err(e)) => {
+                    error!("Failed to fetch data: {:?}", e);
+                    values.push(json!({"error": e.to_string()}));
+                }
+                Err(e) => {
+                    error!("Task panicked: {:?}", e);
+                    values.push(json!({"error": "Task panicked"}));
+                }
+            }
+        }
+
+        serde_json::json!(values)
+    }
+    
+
+    async fn fetch_crypto_data(
+        &self, 
+        symbol: &str, 
+        fetch_type: FetchType,
+        timeframe: Option<&str>, 
+        from: Option<&str>,
+        to: Option<&str>
+    ) -> Result<Value, ForexError> {
+        match fetch_type {
+            FetchType::IntraDay => self.intraday(
+                symbol, timeframe.unwrap_or(TimeFrame::FiveMinutes.to_str()), 
+                from, to).await
+            .map_err(|err| ForexError::FetchError(err.to_string())),
+            FetchType::Daily => self.daily(symbol)
+            .await
+            .map_err(|err| ForexError::FetchError(err.to_string())),
+            _ => Err(ForexError::TaskError(format!("Invalid fecth type: {:?}", fetch_type))),
+        }
     }
 
     async fn validate_tickers(&self, tickers: Vec<String>) -> Result<Vec<String>, ForexError> {
-        let valid_tickers = self.list().await?;
-        let valid_tickers = valid_tickers.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<HashSet<_>>();
-        let invalid_tickers = tickers.iter().filter(|t| !valid_tickers.contains(t.as_str())).collect::<Vec<_>>();
-        if !invalid_tickers.is_empty() {
-            return Err(ForexError::VoidTickersError(format!("Invalid tickers: {:?}", invalid_tickers)));
+        if tickers.len() > self.batch_config.batch_size {
+            return Err(ForexError::TooManyTickersError(format!("Too many tickers: {}", tickers.len())));
+        } else if tickers.is_empty() {
+            return Err(ForexError::VoidTickersError("No tickers provided".to_string()));
         }
         Ok(tickers)
     }
 
-    async fn retry<F, Fut, T, E>(
-        retry_config:  &RetryConfig,
-        mut operation: F,
-    )-> Result<T, E> 
-    where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    {
-        let mut attempts = 0;
-        let mut delay = retry_config.base_delay_ms;
-        loop {
-            match operation().await {
-                Ok(value) => return Ok(value),
+    pub async fn batch_level_concurrency(
+        &self, 
+        tickers: Vec<String>,
+        fetch_type: FetchType,
+        timeframe: Option<String>,
+        from: Option<String>,
+        to: Option<String>
+    ) -> Result<Value, ForexError> {
+        let config = self.batch_config.clone();
+        
+        let symbols = self.validate_tickers(tickers).await?;
+    
+        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
+        let mut tasks = vec![];
+    
+        for chunk in symbols.chunks(config.batch_size) {
+            let batch = chunk.to_vec();
+            let (batc_config, semaphore, retry_config) = clone_arc_refs((&self.batch_config, &semaphore, &self.retry_config));
+            let (timeframe, from, to) = clone_str_options((&timeframe, &from, &to));
+
+    
+            let self_clone = self.clone();
+            let task = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await
+                    .map_err(|e| ForexError::TaskError(e.to_string()));
+                self_clone.ticker_level_concurrency(batch, fetch_type, timeframe, from, to).await
+            });
+            tasks.push(task);
+        }
+    
+        let results: Vec<_> = futures_util::future::join_all(tasks).await;
+        let mut values = vec![];
+    
+        for result in results {
+            match result {
+                Ok(value) => values.push(value),
                 Err(e) => {
-                    if attempts >= retry_config.max_attempts {
-                        return Err(e);
-                    }
-                    attempts += 1;
-                    sleep(Duration::from_millis(delay)).await;
-                    delay = delay * 2;
-                    if delay > retry_config.max_delay_ms {
-                        delay = retry_config.max_delay_ms;
-                    }
+                    error!("Task failure: {:?}", e);
+                    values.push(json!({"error": "Task panicked"}));
                 }
             }
         }
-    }
-
-    async fn process_batch(
-        &self,
-        tickers: Vec<(String, String)>,
-        fetch_type: FetchType, 
-    ) -> Result<Value, ForexError> {
-        let tickers = tickers
-            .into_iter()
-            .map(|(from, to)| format!("{}{}", from, to))
-            .collect::<Vec<_>>();
-        let tickers = self.validate_tickers(tickers).await?;
-        let tickers = tickers
-            .into_iter()
-            .map(|ticker| (ticker[..3].to_string(), ticker[3..].to_string()))
-            .collect::<Vec<_>>();
-
-        let concurrrency_limit = self.retry_config.concurrency_limit;
-
-        let start = Instant::now();
-        let mut tasks = Vec::new();
-
-        //Shared self
-        let shared_self = Arc::new(Self::new());
     
-        
-        for ticker in tickers {
-            let retry_config = Arc::clone(&self.retry_config);
-            let fetch_type = fetch_type.clone();
-            let ticker = ticker.clone();
-            let semaphore = self.semaphore.clone();
-
-            let self_ref = Arc::clone(&shared_self);
-            
-            let task = tokio::spawn(async move {
-                let bind = Arc::clone(&semaphore);
-                let semaphore = bind.lock().await;
-                let permit = &semaphore.acquire().await.unwrap();
-                let operation = || async {
-                    match fetch_type {
-                        FetchType::List => self_ref.list().await,
-                        FetchType::Rate => self_ref.rate((&ticker.0, &ticker.1)).await,
-                        FetchType::Historical => {
-                            self_ref.history((&ticker.0, &ticker.1), None, None, None, None).await
-                        }
-                        _ => unreachable!(),
-                    }
-                };
-
-                let result = Self::retry(&retry_config, operation).await;
-
-                // Drop the semaphore permit
-                drop(permit);
-
-                match result {
-                    Ok(value) => {
-                        counter!("forex.success").increment(1);
-                        value
-                    },
-                    Err(e) => {
-                        error!("Failed to fetch data for {}: {:?}{:?}", ticker.0, ticker.1, e);
-                        counter!("forex.failures").increment(1);
-                        Value::Null
-                    },
-                }
-                    
-            });
-            tasks.push(task);
-
-        }
-    
-        let results = futures::future::join_all(tasks).await;
-        let mut values = Vec::new();
-        for result in results {
-            values.push(result.unwrap());
-        }
-
-        let elapsed = start.elapsed();
-        gauge!("forex.batch_duration", "rate limit" => format!("{}", elapsed.as_secs_f64()));
-        
         Ok(Value::Array(values))
     }
 
-    pub async fn poll(&self, tickers: Vec<(String, String)>, fetch_type: FetchType) -> Result<(), ForexError> {
-        let config = Arc::clone(&self.batch_config);
-        
-        let mut futures = vec![];
+    pub async fn poll(&self, value: &Value) -> Result<Value, ForexError> {
+        let tickers = value.get("tickers")
+        .and_then(Value::as_array)
+        .ok_or(ForexError::ParseError("Missing 'tickers' field".to_string()))?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(Self::normalize_symbol)
+        .collect::<Vec<String>>();
 
-        for chunk in tickers.chunks(config.batch_size) {
-            let chunk = chunk.to_vec();
-            let fetch_type = fetch_type.clone();
-            let self_ref = Self::new();
-            let future = tokio::spawn(async move {
-                self_ref.process_batch(chunk, fetch_type).await
-            });
-            futures.push(future);
-        }
+    let fetch_type_str = value.get("fetch_type")
+        .and_then(Value::as_str)
+        .ok_or(ForexError::ParseError("Missing 'fetch_type' field".to_string()))?;
 
-        for future in futures {
-            match future.await {
-                Ok(value) => info!("Task completed successfully: {:?}", value),
-                Err(e) => error!("Task encountered an error: {:?}", e),
-                
-            }
-        }
+    let fetch_type = FetchType::from_str(fetch_type_str);
 
-        Ok(())
-    }    
+    let timeframe = value.get("timeframe").and_then(Value::as_str).map(String::from);
+    let from = value.get("from").and_then(Value::as_str).map(String::from);
+    let to = value.get("to").and_then(Value::as_str).map(String::from);
+    
+    self.batch_level_concurrency(tickers, fetch_type, timeframe, from, to).await
+    }
 }

@@ -20,7 +20,7 @@ use crate::config::{RetryConfig, BatchConfig};
 use crate::cache::{Cache, SharedLockedCache};
 use crate::options::{TimeFrame, DateTime, FetchType};
 
-const LIST_PATH: &str = "available-forex-currency-pairs";
+const LIST_PATH: &str = "symbol/available-cryptocurrencies";
 const INTRADAY_PATH: &str = "history-chart";
 const DAILY_PATH: &str = "historical-price-full";
 

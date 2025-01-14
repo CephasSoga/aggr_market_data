@@ -28,7 +28,7 @@ use crate::config::{RetryConfig, BatchConfig};
 use crate::cache::{Cache, SharedCache, SharedLockedCache};
 
 
-const LIST_PATH: &str = "stoc/list";
+const LIST_PATH: &str = "stock/list";
 const QUOTE_PATH: &str = "quote";
 const RATING_PATH: &str = "company/rating";
 const PROFILE_PATH: &str= "profile";

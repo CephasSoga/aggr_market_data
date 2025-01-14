@@ -123,6 +123,13 @@ pub enum FetchType {
     SplitHistory,
     IntraDay,
     Daily,
+    Gainers,
+    Losers,
+    Actives,
+    Performance,
+    SectorHistorical,
+    IndustryPERatio,
+    SectorPERatio,
 }
 impl FetchType {
     pub fn from_str(s: &str) -> Self {
@@ -137,6 +144,13 @@ impl FetchType {
             "split_history" => FetchType::SplitHistory,
             "intraday" => FetchType::IntraDay,
             "daily" => FetchType::Daily,
+            "gainers" => FetchType::Gainers,
+            "losers" => FetchType::Losers,
+            "actives" => FetchType::Actives,
+            "sector_performance" => FetchType::Performance,
+            "sector_historical_performance" => FetchType::SectorHistorical,
+            "industry_pe_ratio" => FetchType::IndustryPERatio,
+            "sector_pe_ratio" => FetchType::SectorPERatio,
             _ => unreachable!(),
         }
     }
