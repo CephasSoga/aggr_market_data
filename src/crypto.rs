@@ -15,7 +15,7 @@ use futures_util::Future;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::utils::{retry, clone_str_options, clone_arc_refs};
+use crate::utils::{retry, clone_str_options, clone_arc_refs, get_from_cache_or_fetch};
 use crate::config::{RetryConfig, BatchConfig};
 use crate::cache::{Cache, SharedLockedCache};
 use crate::options::{TimeFrame, DateTime, FetchType};
@@ -233,13 +233,29 @@ impl CryptoPolling {
         to: Option<&str>
     ) -> Result<Value, CryptoError> {
         match fetch_type {
-            FetchType::IntraDay => self.intraday(
-                symbol, timeframe.unwrap_or(TimeFrame::FiveMinutes.to_str()), 
-                from, to).await
-            .map_err(|err| CryptoError::FetchError(err.to_string())),
-            FetchType::Daily => self.daily(symbol)
-            .await
-            .map_err(|err| CryptoError::FetchError(err.to_string())),
+            FetchType::IntraDay => {
+                let key = format!("intraday_{}_{}", symbol, timeframe.unwrap_or(TimeFrame::FiveMinutes.to_str()));
+                let retry_cfg = self.retry_config.clone();
+                let timeframe = timeframe.unwrap_or(TimeFrame::FiveMinutes.to_str());
+                retry(&retry_cfg, || async {
+                    self.get_from_cache_or_fetch(&key, || async {
+                        self.intraday(symbol, timeframe, from, to).await}, self.batch_config.cache_ttl).await 
+                })
+                .await
+                .map_err(|err| CryptoError::FetchError(err.to_string()))
+            }
+            FetchType::Daily => {
+                let key = format!("daily_{}", symbol);
+                let retry_cfg = self.retry_config.clone();
+                retry(&retry_cfg, || async {
+                    self.get_from_cache_or_fetch(&key, || async {
+                        self.daily(symbol).await
+                    }, self.batch_config.cache_ttl).await
+                })
+                .await
+                .map_err(|err| CryptoError::FetchError(err.to_string()))
+
+            }
             _ => Err(CryptoError::TaskError(format!("Invalid fecth type: {:?}", fetch_type))),
         }
     }
@@ -299,26 +315,26 @@ impl CryptoPolling {
         Ok(Value::Array(values))
     }
 
-    pub async fn poll(&self, value: &Value) -> Result<Value, CryptoError> {
-        let tickers = value.get("tickers")
-        .and_then(Value::as_array)
-        .ok_or(CryptoError::ParseError("Missing 'tickers' field".to_string()))?
-        .iter()
-        .filter_map(Value::as_str)
-        .map(Self::normalize_symbol)
-        .collect::<Vec<String>>();
+    pub async fn poll(&self, args: &Value) -> Result<Value, CryptoError> {
+        let tickers = args.get("tickers")
+            .and_then(Value::as_array)
+            .ok_or(CryptoError::ParseError("Missing 'tickers' field".to_string()))?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(Self::normalize_symbol)
+            .collect::<Vec<String>>();
 
-    let fetch_type_str = value.get("fetch_type")
-        .and_then(Value::as_str)
-        .ok_or(CryptoError::ParseError("Missing 'fetch_type' field".to_string()))?;
+        let fetch_type_str = args.get("fetch_type")
+            .and_then(Value::as_str)
+            .ok_or(CryptoError::ParseError("Missing 'fetch_type' field".to_string()))?;
 
-    let fetch_type = FetchType::from_str(fetch_type_str);
+        let fetch_type = FetchType::from_str(fetch_type_str);
 
-    let timeframe = value.get("timeframe").and_then(Value::as_str).map(String::from);
-    let from = value.get("from").and_then(Value::as_str).map(String::from);
-    let to = value.get("to").and_then(Value::as_str).map(String::from);
-    
-    self.batch_level_concurrency(tickers, fetch_type, timeframe, from, to).await
+        let timeframe = args.get("timeframe").and_then(Value::as_str).map(String::from);
+        let from = args.get("from").and_then(Value::as_str).map(String::from);
+        let to = args.get("to").and_then(Value::as_str).map(String::from);
+        
+        self.batch_level_concurrency(tickers, fetch_type, timeframe, from, to).await
     }
 }
 

@@ -2,14 +2,15 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
-use std::time::{Duration, SystemTime};
+use std::time::{Instant, Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use tokio::time::sleep;
 use futures_util::Future;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use serde_json::Value;
+use tokio::sync::{Mutex, Semaphore};
 use crate::config::{RetryConfig, BatchConfig};
-use crate::cache::{SharedCache, SharedLockedCache};
+use crate::cache::{Cache,SharedCache, SharedLockedCache};
 
 pub fn now() -> String {
     let now = SystemTime::now();
@@ -50,6 +51,38 @@ where
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+
+pub async fn get_from_cache_or_fetch<F: Future<Output = Result<Value, Box<dyn std::error::Error>>>>(
+    cache: &Arc<Mutex<SharedLockedCache>>,
+    key: &str,
+    fetch_fn: F,
+    ttl: Duration,
+) ->   Result<Value, Box<dyn std::error::Error>> 
+where F: Future<Output = Result<Value, Box<dyn std::error::Error>>> {
+    println!("Looking in cache");
+    let mut cache = cache.lock().await;
+    if let Some((value, instant)) = cache.get(key).await {
+        println!("Found in cache");
+        if instant.elapsed() < Duration::from_secs(60) {
+            return Ok(value.clone());
+        } else {
+            println!("Expired");
+            cache.pop(key);// Expired
+        }
+    }
+    println!("Fetching...");
+    // Fetch and cache the value
+    let result = fetch_fn.await;
+    match result {
+        Ok(value) => {
+            println!("Got value: {:?}", value);
+            cache.put(key.to_string(), (value.clone(), Instant::now()));
+            Ok(value)
+        }
+        Err(e) => Err(e),
     }
 }
 

@@ -17,13 +17,13 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use futures_util::Future;
-use std::fmt::Display;
 use lru::LruCache;
 use tokio::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
 use crate::utils::{retry, clone_str_options, clone_arc_refs};
+use crate::options::FetchType;
 use crate::config::{RetryConfig, BatchConfig};
 use crate::cache::{Cache, SharedCache, SharedLockedCache};
 
@@ -38,33 +38,6 @@ const CURRENT_PRICE_PATH: &str = "real-time-price";
 const HISTORY_PATH: &str = "historical-price-full";
 const SPLIT_HISTORY_PATH: &str = "stock_split";
 const DIVIDEND_HISTORY_PATH: &str = "stock_dividend";
-
-#[derive(Clone, Copy)]
-pub enum FetchType {
-    Quote,
-    Financial,
-    Profile,
-    Rating,
-    Outlook,
-    History,
-    DividendHistory,
-    SplitHistory,
-}
-impl FetchType {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "quote" => FetchType::Quote,
-            "financial" => FetchType::Financial,
-            "profile" => FetchType::Profile,
-            "rating" => FetchType::Rating,
-            "outlook" => FetchType::Outlook,
-            "history" => FetchType::History,
-            "dividend_history" => FetchType::DividendHistory,
-            "split_history" => FetchType::SplitHistory,
-            _ => unreachable!(),
-        }
-    }
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Stock{
@@ -99,9 +72,9 @@ pub enum StockError {
 /// Functions for accessing stock-related data from the FMP API.
 pub struct StockPolling {
     http_client: Arc<HTTPClient>,
-   cache: Arc<Mutex<SharedLockedCache>>,
-   batch_config: Arc<BatchConfig>,
-   retry_config: Arc<RetryConfig>,
+    cache: Arc<Mutex<SharedLockedCache>>,
+    batch_config: Arc<BatchConfig>,
+    retry_config: Arc<RetryConfig>,
 }
 
 impl StockPolling {
@@ -135,18 +108,14 @@ impl StockPolling {
         ttl: Duration,
     ) ->   Result<Value, StockError> 
     where F: Future<Output = Result<Value, StockError>> {
-        println!("Looking in cache");
         let mut cache = self.cache.lock().await;
         if let Some((value, instant)) = cache.get(key).await {
-            println!("Found in cache");
             if instant.elapsed() < Duration::from_secs(60) {
                 return Ok(value.clone());
             } else {
-                println!("Expired");
                 cache.pop(key);// Expired
             }
         }
-        println!("Fetching...");
         // Fetch and cache the value
         let result = fetch_fn.await;
         match result {
@@ -324,32 +293,6 @@ impl StockPolling {
         }
         Ok(tickers)
     }
-
-    async fn retry<F, Fut, T, E>(
-        config: &RetryConfig,
-        mut operation: F,
-    ) -> Result<T, E>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-    {
-        let mut attempts = 0;
-    
-        loop {
-            attempts += 1;
-            match operation().await {
-                Ok(value) => return Ok(value),
-                Err(err) if attempts < config.max_attempts => {
-                    let delay = std::cmp::min(
-                        config.base_delay_ms * (2u64.pow(attempts - 1)),
-                        config.max_delay_ms,
-                    );
-                    sleep(Duration::from_millis(delay)).await;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-    }
     
     async fn ticker_level_concurrency(
         &self,
@@ -363,7 +306,6 @@ impl StockPolling {
         // Configurable concurrency limit
         let concurrency_limit = 10; // Adjust as needed
         let semaphore = Arc::new(Semaphore::new(concurrency_limit));
-        let retry_config = RetryConfig::default();
     
         let start = Instant::now();
         let mut tasks = Vec::new();
@@ -377,7 +319,7 @@ impl StockPolling {
     
         for ticker in tickers {
             let permit = semaphore.clone().acquire_owned().await.unwrap(); // Acquire semaphore permit
-            let retry_config = retry_config.clone(); // Clone retry config for each task
+            let retry_config = self.retry_config.clone(); // Clone retry config for each task
             let fetch_type = fetch_type.clone(); // Clone fetch type
             let ticker = ticker.clone(); // Clone ticker for task
 
@@ -399,7 +341,7 @@ impl StockPolling {
                     }
                 };
     
-                let result = Self::retry(&retry_config, operation).await;
+                let result = retry(&retry_config, operation).await;
     
                 // Release semaphore automatically when task completes
                 drop(permit);
@@ -480,8 +422,8 @@ impl StockPolling {
     }
 
 
-    pub async fn poll(&self, value: &Value) -> Result<Value, StockError> {
-        let tickers = value.get("tickers")
+    pub async fn poll(&self, args: &Value) -> Result<Value, StockError> {
+        let tickers = args.get("tickers")
         .and_then(Value::as_array)
         .ok_or(StockError::ParseError("Missing 'tickers' field".to_string()))?
         .iter()
@@ -489,7 +431,7 @@ impl StockPolling {
         .map(String::from)
         .collect::<Vec<String>>();
 
-    let fetch_type_str = value.get("fetch_type")
+    let fetch_type_str = args.get("fetch_type")
         .and_then(Value::as_str)
         .ok_or(StockError::ParseError("Missing 'fetch_type' field".to_string()))?;
 

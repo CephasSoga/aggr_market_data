@@ -4,8 +4,10 @@
 
 use std::collections::HashMap;
 
-use crate::request::{make_request, generate_json};
+use crate::options::{DateTime, TimeFrame, FetchType, IndicatorType};
+use crate::request::HTTPClient;
 use crate::financial::Financial;
+use crate::utils::{clone_str_options, clone_arc_refs, retry};
 use clap::builder::Str;
 use serde::de::value;
 use tokio::time::sleep;
@@ -16,80 +18,20 @@ use metrics::{counter, gauge};
 use tracing::{info, error};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use futures_util::Future;
 use std::fmt::Display;
-use lru::LruCache;
 use tokio::sync::Mutex;
 use thiserror::Error;
 
+use crate::cache::{Cache, SharedLockedCache};
 use crate::config::{RetryConfig, BatchConfig};
 
-#[derive(Debug, Clone)]
-pub enum IndicatorType {
-    sma,
-    ema,
-    wma,
-    dema,
-    tema,
-    williams,
-    rsi,
-    adx,
-    standardDeviation,
-}
-impl IndicatorType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::sma => "sma",
-            Self::ema => "ema",
-            Self::wma => "wma",
-            Self::dema => "dema",
-            Self::tema => "tema",
-            Self::williams => "williams",
-            Self::rsi => "rsi",
-            Self::adx => "adx",
-            Self::standardDeviation => "standardDeviation",
-        }
-    }
-}
+const INDICATOR_PATH: &str = "technical_indicator";
 
-#[derive(Debug, Clone)]
-pub enum Timeframe {
-    OneMinute,
-    FiveMinutes,
-    FifteenMinutes,
-    ThirtyMinutes,
-    OneHour,
-    TwoHours,
-    FourHours,
-    SixHours,
-    TwelveHours,
-    OneDay,
-    ThreeDays,
-    OneWeek,
-    OneMonth,
-}
-impl Timeframe {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::OneMinute => "1m",
-            Self::FiveMinutes => "5m",
-            Self::FifteenMinutes => "15m",
-            Self::ThirtyMinutes => "30m",
-            Self::OneHour => "1h",
-            Self::TwoHours => "2h",
-            Self::FourHours => "4h",
-            Self::SixHours => "6h",
-            Self::TwelveHours => "12h",
-            Self::OneDay => "1d",
-            Self::ThreeDays => "3d",
-            Self::OneWeek => "1w",
-            Self::OneMonth => "1M",
-        }
-    }
-}
 
-#[derive(Debug, Error)]
+
+
+#[derive(Debug, Error, Serialize, Deserialize)]
 pub enum IndicatorError {
     #[error("Failed to fetch data: {0}")]
     FetchError(String),
@@ -102,37 +44,65 @@ pub enum IndicatorError {
     
     #[error("No tickers provided: {0}")]
     VoidTickersError(String),
+
+    #[error("Invalid ticker: {0}")]
+    InvalidTicker(String),
+
+    #[error("Too many tickers: {0}")]
+    TooManyTickersError(String),
 }
 
 pub struct TechnicalIndicatorPolling {
-    cache: Arc<Mutex<LruCache<String, (Value, Instant)>>>,
+    http_client: Arc<HTTPClient>,
+    cache: Arc<Mutex<SharedLockedCache>>,
     batch_config: Arc<BatchConfig>,
+    retry_config: Arc<RetryConfig>,
 }
 impl TechnicalIndicatorPolling {
-    pub fn new() -> Self {
+    pub fn new(
+        http_client: Arc<HTTPClient>,
+        cache: Arc<Mutex<SharedLockedCache>>, 
+        batch_config: Arc<BatchConfig>, 
+        retry_config: Arc<RetryConfig>
+    ) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))),
-            batch_config: Arc::new(BatchConfig::default()),
+            http_client,
+            cache,
+            batch_config,
+            retry_config
+        }
+    }
+    pub fn clone(&self) -> Self {
+        Self {
+            http_client: self.http_client.clone(),
+            cache: self.cache.clone(),
+            batch_config: self.batch_config.clone(),
+            retry_config: self.retry_config.clone(),
         }
     }
 
-    pub async fn get_from_cache_or_fetch<F: Future<Output = Result<Value, IndicatorError>>>(
+    async fn get_from_cache_or_fetch<F, Fut>(
         &self, 
         key: &str, 
         fetch_fn: F, 
         ttl: Duration
-    ) -> Result<Value, IndicatorError> where F: Future<Output = Result<Value, IndicatorError>> {
+    ) 
+    -> Result<Value, IndicatorError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, IndicatorError>>,
+    {
         let mut cache = self.cache.lock().await;
-        if let Some((value, instant)) = cache.get(key) {
+        if let Some((value, instant)) = cache.get(key).await {
             if instant.elapsed() < Duration::from_secs(60) {
                 return Ok(value.clone());
             } else {
-                cache.pop(key);// Expired
+                cache.pop(key).await;// Expired
             }
         }
         
         // Fetch and cache the value
-        let result = fetch_fn.await;
+        let result = fetch_fn().await;
         match result {
             Ok(value) => {
                 cache.put(key.to_string(), (value.clone(), Instant::now()));
@@ -142,128 +112,199 @@ impl TechnicalIndicatorPolling {
         }
     }
 
-    async fn get_indicator_value(&self, ticker: &str, indicator: &IndicatorType, timeframe: &Timeframe, period: Option<u32>) -> Result<Value, IndicatorError> {
-        let partial_path = format!("technical_indicator/{}/{}", timeframe.as_str(), ticker);
+    async fn get_indicator_value(
+        &self, 
+        ticker: &str, 
+        indicator: &IndicatorType, 
+        timeframe: &TimeFrame, 
+        period: u64,
+        from: Option<DateTime>,
+        to: Option<DateTime>
+    ) -> Result<Value, IndicatorError> {
+        let path = self.http_client.join(vec![INDICATOR_PATH, timeframe.to_str(), ticker]);
+        println!("Path: {}", path);
+        let query_params = json!({
+            "type": indicator.as_str(),
+            "period": period.to_string(),
+            "from": from.map(|d| d.year_month_and_day()),
+            "to": to.map(|d| d.year_month_and_day()),
+        });
 
-        let mut query_param: HashMap<String, _> = HashMap::new();
-        query_param.insert(
-            "type".to_string(), Value::String(indicator.as_str().to_string())
-        );
-        query_param.insert(
-            "period".to_string(), Value::Number(serde_json::Number::from(period.unwrap_or(10)))
-        );
+        let query_params = self.http_client.build_query_from_value(query_params);
 
-        make_request(partial_path.as_str(), query_param)
+        self.http_client.get(path.as_str(), Some(query_params))
             .await
             .map_err(|e| IndicatorError::FetchError(e.to_string()))
 
     }
 
-    pub async fn get_indicators_for_ticker(&self, ticker: &str, timeframe: &Timeframe) -> Result<Value, IndicatorError> {
-        let indicators = vec![
-            IndicatorType::sma,
-            IndicatorType::ema,
-            IndicatorType::wma,
-            IndicatorType::dema,
-            IndicatorType::tema,
-            IndicatorType::williams,
-            IndicatorType::rsi,
-            IndicatorType::adx,
-            IndicatorType::standardDeviation,
-        ];
-
-        let mut result = json!({});
-        for indicator in indicators {
-            let key = format!("{}_{}_{}", ticker, indicator.as_str(), timeframe.as_str());
-            let indicator_value = self.get_from_cache_or_fetch(&key, self.get_indicator_value(ticker, &indicator, &timeframe, None), Duration::from_secs(60)).await?;
-            result[indicator.as_str()] = indicator_value;
-        }
-
-        Ok(result)
-    }
-
-    async fn validate_tickers(tickers: Option<Vec<String>>) -> Result<Vec<String>, IndicatorError> {
-        tickers.map_or(Err(IndicatorError::VoidTickersError("No tickers provided".to_string())), |t| {
-            if t.is_empty() {
-                Err(IndicatorError::VoidTickersError("No tickers provided".to_string()))
-            } else {
-                Ok(t)
-            }
-        })
-    }
-
-    async fn process_batch(
+    async fn get_indicators_for_ticker(
         &self, 
-        batch: Vec<String>,
-        timeframe: &Timeframe,
-        config: &BatchConfig
-    ) -> Result<(), IndicatorError> {
-        let start = Instant::now();
-        let mut rate_limiter = tokio::time::interval(Duration::from_secs_f32(
-            1.0 / config.rate_limit_per_second as f32
-        ));
-
-        for symbol in batch {
-            rate_limiter.tick().await;
-            let mut attempts = 0;
-            while attempts < config.retry_attempts {
-                match self.get_indicators_for_ticker(&symbol, timeframe).await {
-                    Ok(_) => {
-                        counter!("etf.success").increment(1);
-                        break;
-                    }
-                    Err(e) => {
-                        attempts += 1;
-                        counter!("etf.retries").increment(1);
-                        if attempts == config.retry_attempts {
-                            error!("Final retry failed for {}: {:?}", symbol, e);
-                            counter!("etf.failures").increment(1);
-                        } else {
-                            tokio::time::sleep(Duration::from_millis(config.backoff_ms * attempts as u64)).await;
-                        }
-                    }
-                }
+        ticker: &str,
+        fetch_type: FetchType, 
+        indicator: String, 
+        timeframe: String, 
+        period: u64,
+        from: Option<String>,
+        to: Option<String>
+    ) -> Result<Value, IndicatorError> {
+        match fetch_type {
+            FetchType::TechnicalIndicator => {
+                let indicator = IndicatorType::from_str(&indicator).unwrap_or(IndicatorType::sma);
+                let timeframe = TimeFrame::from_str(&timeframe).unwrap_or(TimeFrame::OneDay);
+                let from = from.map(|s| DateTime::from_str(&s)
+                    .map_err(|e| IndicatorError::ParseError(e.to_string()))
+                    .unwrap().to_owned());
+                let to = to.map(|s| DateTime::from_str(&s)
+                    .map_err(|e| IndicatorError::ParseError(e.to_string()))
+                    .unwrap().to_owned());
+                
+                let retry_cfg = self.retry_config.clone();
+                let key = format!("{}-{}-{}-{}-{:?}-{:?}", ticker, indicator, timeframe, period, &from, &to);
+                retry(&retry_cfg,  || async {
+                    let from  = from.clone();
+                    let to = to.clone();
+                    self.get_from_cache_or_fetch(
+                        &key, 
+                        || async {
+                            self.get_indicator_value(ticker, &indicator, &timeframe, period, from, to).await
+                        }, 
+                        self.batch_config.cache_ttl).await
+                }).await.map_err(|e| IndicatorError::TaskError(e.to_string()))
             }
+            _ => Err(IndicatorError::FetchError("Invalid fetch type".to_string()))
         }
-        
-        gauge!("etf.batch_time", "rate limit" => format!("{}", start.elapsed().as_secs_f64()));
-        Ok(())
     }
 
-    pub async fn poll(&self, tickers: Option<Vec<String>>, timeframe: Option<Timeframe>) -> Result<(), IndicatorError> {
+    async fn validate_tickers(&self, tickers: Vec<String>) -> Result<Vec<String>, IndicatorError> {
+        if tickers.len() > self.batch_config.batch_size {
+            return Err(IndicatorError::TooManyTickersError(format!("Too many tickers: {}", tickers.len())));
+        } else if tickers.is_empty() {
+            return Err(IndicatorError::VoidTickersError("No tickers provided".to_string()));
+        }
+        Ok(tickers)
+    }
+
+    async fn ticker_level_concurrency(
+        &self, 
+        tickers: Vec<String>, 
+        fetch_type: FetchType, 
+        indicator: String, 
+        timeframe: String, 
+        period: u64, 
+        from: Option<String>, 
+        to: Option<String>
+    ) -> Result<Value, IndicatorError> {
         let config = self.batch_config.clone();
-        let symbols = Self::validate_tickers(tickers).await?;
-        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
-        let timeframe = timeframe.unwrap_or(Timeframe::OneDay);
+        let tickers = self.validate_tickers(tickers).await?;
+        let semaphore = std::sync::Arc::new(Semaphore::new(config.concurrency_limit));
+        let mut tasks = Vec::new();
 
-        let mut tasks = vec![];
+        for ticker in tickers {
+            let semaphore = semaphore.clone();
+            let fetch_type = fetch_type.clone();
+            let (tickker, indicator, timeframe, period) = (ticker.clone(), indicator.clone(), timeframe.clone(), period.clone());
+            let (from, to) = clone_str_options((&from, &to));
+            let self_clone = self.clone();
 
-        for chunk in symbols.chunks(config.batch_size) {
-            let batch = chunk.to_vec();
-            let semaphore_clone = semaphore.clone();
-            let config_clone = config.clone();
-            let self_clone = Self::new();
-            let timeframe = timeframe.clone();
-
-            let task = tokio::spawn(async move {
-                let _permit = semaphore_clone.acquire().await
-                    .map_err(|e| IndicatorError::TaskError(e.to_string()))?;
-
-                self_clone.process_batch(batch, &timeframe, &config_clone).await
-            });
-            tasks.push(task);
+            tasks.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();    
+                self_clone.get_indicators_for_ticker(
+                    &ticker, 
+                    fetch_type, 
+                    indicator, 
+                    timeframe, 
+                    period, 
+                    from.map(|s| s), 
+                    to.map(|s| s)).await
+            }));
         }
-
+        let mut results = Vec::new();    
         for task in tasks {
-            match task.await {
-                Ok(result) => if let Err(e) = result {
-                    error!("Batch processing error: {:?}", e);
-                },
-                Err(e) => error!("Task failure: {:?}", e),
-            }
+            let result = task.await.unwrap();
+            match result {
+                Ok(value) => results.push(value),
+                Err(e) => results.push(Value::Null),
+            };
+        }
+        Ok(Value::Array(results))
+    }
+
+    async fn batch_level_concurrency(
+        &self, 
+        tickers: Vec<String>, 
+        fetch_type: FetchType, 
+        indicator: String, 
+        timeframe: String, 
+        period: u64, 
+        from: Option<String>, 
+        to: Option<String>
+    ) -> Result<Value, IndicatorError> {
+        let config = self.batch_config.clone();
+        let tickers = self.validate_tickers(tickers).await?;
+        let semaphore = std::sync::Arc::new(Semaphore::new(config.concurrency_limit));
+        
+        let mut tasks = Vec::new();
+
+        for chunk in tickers.chunks(config.batch_size) {
+
+            let batch = chunk.to_vec();
+    
+            let (semaphore, fetch_type, indicator, timeframe, period) = (
+                semaphore.clone(), fetch_type.clone(), indicator.clone(), timeframe.clone(), period.clone());     
+            let (from, to) = clone_str_options((&from, &to));
+            let self_clone = self.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                self_clone.ticker_level_concurrency(batch, fetch_type, indicator, timeframe, period, from, to).await
+            }));
         }
 
-        Ok(())
+        let mut results = Vec::new();    
+        for task in tasks {
+            let result = task.await.unwrap();
+            match result {
+                Ok(result) => results.push(result),
+                Err(e) => results.push(Value::Null),
+            };
+        }
+        Ok(Value::Array(results))
+
+    }
+    pub async fn poll(&self, args: &Value) -> Result<Value, IndicatorError> {
+        let tickers = args.get("tickers")
+            .and_then(Value::as_array)
+            .ok_or(IndicatorError::ParseError("Missing 'tickers' field".to_string()))?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect::<Vec<String>>();
+
+        let fetch_type = args.get("fetch_type")
+            .and_then(Value::as_str)
+            .map(FetchType::from_str)
+            .ok_or(IndicatorError::ParseError("Missing 'fetch_type' field".to_string()))?;
+
+
+        let indicator = args.get("indicator")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or(IndicatorError::ParseError("Missing 'indicator' field".to_string()))?;
+
+        let period = args.get("period")
+            .and_then(Value::as_u64)
+            .ok_or(IndicatorError::ParseError("Missing 'period' field".to_string()))?;
+
+        let timeframe = args.get("timeframe")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or(IndicatorError::ParseError("Missing 'timeframe' field".to_string()))?;
+
+        let from = args.get("from").and_then(Value::as_str).map(String::from);
+        let to = args.get("to").and_then(Value::as_str).map(String::from);
+        
+        self.batch_level_concurrency(tickers, fetch_type, indicator, timeframe, period, from, to).await
     }
         
             

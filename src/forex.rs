@@ -235,13 +235,31 @@ impl ForexPolling {
         to: Option<&str>
     ) -> Result<Value, ForexError> {
         match fetch_type {
-            FetchType::IntraDay => self.intraday(
-                symbol, timeframe.unwrap_or(TimeFrame::FiveMinutes.to_str()), 
-                from, to).await
-            .map_err(|err| ForexError::FetchError(err.to_string())),
-            FetchType::Daily => self.daily(symbol)
-            .await
-            .map_err(|err| ForexError::FetchError(err.to_string())),
+            FetchType::IntraDay => {
+                let key = format!("{}-{}-{}-{}", symbol, timeframe.unwrap_or(""), from.unwrap_or(""), to.unwrap_or(""));
+                let retry_cfg = self.retry_config.clone();
+                let timeframe = timeframe.unwrap_or(TimeFrame::FiveMinutes.to_str());
+
+                retry(&retry_cfg, || async {
+                    self.get_from_cache_or_fetch(&key, || async {
+                        self.intraday(symbol, timeframe, from, to).await
+                    }, self.batch_config.cache_ttl).await
+                })
+                .await
+                .map_err(|err| ForexError::FetchError(err.to_string()))
+            },
+            FetchType::Daily => {
+                let key = format!("forex_daily_{}", symbol);
+                let retry_cfg = self.retry_config.clone();
+
+                retry(&retry_cfg, || async {
+                    self.get_from_cache_or_fetch(&key, || async {
+                        self.daily(symbol).await
+                    }, self.batch_config.cache_ttl).await
+                })
+                .await
+                .map_err(|err| ForexError::FetchError(err.to_string()))
+            },
             _ => Err(ForexError::TaskError(format!("Invalid fecth type: {:?}", fetch_type))),
         }
     }

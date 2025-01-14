@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 
 //-----------------------TimeFrme---------------: START
 #[derive(Debug, Clone, Copy)]
@@ -9,6 +11,12 @@ pub enum TimeFrame {
     OneHour,
     FourHours,
     OneDay
+}
+
+impl Display for TimeFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_str())
+    }
 }
 impl  TimeFrame {
     pub fn from_str(s: &str) -> Option<TimeFrame> {
@@ -49,6 +57,11 @@ pub struct DateTime {
     pub minute: Option<String>,
     pub second: Option<String>,
     pub millisecond: Option<String>,
+}
+impl Display for DateTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}-{} {}", self.year, self.month, self.day, self.to_string())
+    }
 }
 
 impl DateTime {
@@ -105,6 +118,9 @@ impl DateTime {
         }
         s
     }
+    pub fn year_month_and_day(&self) -> String {
+        format!("{}-{}-{}", self.year, self.month, self.day)
+    }
 }
 
 //------------------DateTime---------------------: END
@@ -130,6 +146,7 @@ pub enum FetchType {
     SectorHistorical,
     IndustryPERatio,
     SectorPERatio,
+    TechnicalIndicator
 }
 impl FetchType {
     pub fn from_str(s: &str) -> Self {
@@ -151,6 +168,7 @@ impl FetchType {
             "sector_historical_performance" => FetchType::SectorHistorical,
             "industry_pe_ratio" => FetchType::IndustryPERatio,
             "sector_pe_ratio" => FetchType::SectorPERatio,
+            "technical_indicator" => FetchType::TechnicalIndicator,
             _ => unreachable!(),
         }
     }
@@ -197,3 +215,52 @@ where
 
 //------------------Either---------------------: END
 
+//-----------------IndicatorType----------------: START
+#[derive(Debug, Clone)]
+pub enum IndicatorType {
+    sma,
+    ema,
+    wma,
+    dema,
+    tema,
+    williams,
+    rsi,
+    adx,
+    standardDeviation,
+}
+impl IndicatorType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::sma => "sma",
+            Self::ema => "ema",
+            Self::wma => "wma",
+            Self::dema => "dema",
+            Self::tema => "tema",
+            Self::williams => "williams",
+            Self::rsi => "rsi",
+            Self::adx => "adx",
+            Self::standardDeviation => "standardDeviation",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "sma" => Some(Self::sma),
+            "ema" => Some(Self::ema),
+            "wma" => Some(Self::wma),
+            "dema" => Some(Self::dema),
+            "tema" => Some(Self::tema),
+            "williams" => Some(Self::williams),
+            "rsi" => Some(Self::rsi),
+            "adx" => Some(Self::adx),
+            "standardDeviation" => Some(Self::standardDeviation),
+            _ => None,
+        }
+    }
+}
+impl Display for IndicatorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+//-----------------IndicatorType----------------: END
