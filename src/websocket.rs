@@ -33,6 +33,7 @@ use crate::index::IndexPolling;
 use crate::economic_data::EconomicDataPolling;
 use crate::technical_indicators::TechnicalIndicatorPolling;
 use crate::market::MarketPolling;
+use crate::search::Search;
 
 const REQUEST_SUCCUESS: u32 = 200;
 const REQUEST_FAILED: u32 = 400;
@@ -280,6 +281,20 @@ impl Collection {
             .unwrap_or_else(|e| Value::String(format!("Market Data polling failed: {}", e)))
     }
 
+    async fn search_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value {
+        let search = Search::new(
+            state.http_client.clone(),
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.retry_config.clone(),
+        );
+        search
+            .find(&args)
+            .await
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Search failed: {}", e)))
+    }
+
     fn stock_polling_func(
         state: Arc<PollState>, 
         args: Arc<Value>
@@ -342,6 +357,15 @@ impl Collection {
             Collection::market_data_polling_unpinned(state, args).await
         })
     }
+
+    fn search_func(
+        state: Arc<PollState>, 
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::search_unpinned(state, args).await
+        })
+    }
     
 }
 
@@ -371,6 +395,7 @@ impl MakeResponse {
         self.register_function("technical_indicators_polling".to_string(), Collection::technical_indicators_polling_func);
         self.register_function("economic_data_polling".to_string(), Collection::economic_data_polling_func);
         self.register_function("market_data_polling".to_string(), Collection::market_data_polling_func);
+        self.register_function( "search_unpinned".to_string(), Collection::search_func);
     }
 
     pub async fn unsafe_make(&self, state: Arc<PollState>, s: &str) -> Value {
@@ -395,10 +420,14 @@ impl MakeResponse {
                             return  self.return_success(message.unwrap());
 
                        }
-                       _ => {}
+                       _ => {
+                           return from_str("Error: The target function is not supported.").unwrap();
+                       }
                    }
                }
-               _ => {}
+               _ => {
+                   return from_str("Error: The argument hashmap is empty.").unwrap();
+               }
            }
         }
         ServerResponse::new(REQUEST_SUCCUESS, None, None).to_json()

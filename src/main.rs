@@ -13,7 +13,7 @@ pub mod index;
 pub mod market;
 //pub mod mutualfund;
 pub mod request;
-//pub mod search;
+pub mod search;
 pub mod stock;
 pub mod technical_indicators;
 pub mod economic_data;
