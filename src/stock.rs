@@ -120,7 +120,6 @@ impl StockPolling {
         let result = fetch_fn.await;
         match result {
             Ok(value) => {
-                println!("Got value: {:?}", value);
                 cache.put(key.to_string(), (value.clone(), Instant::now()));
                 Ok(value)
             }
@@ -298,9 +297,9 @@ impl StockPolling {
         &self,
         tickers: Vec<String>,
         fetch_type: FetchType,
-    ) -> Value {
+    ) -> Result<Value, StockError> {
         if tickers.is_empty() {
-            return Value::Null;
+            return Ok(Value::Null);
         }
     
         // Configurable concurrency limit
@@ -337,7 +336,7 @@ impl StockPolling {
                         FetchType::History => self_clone.history(&ticker, None, None, None, None).await,
                         FetchType::DividendHistory => self_clone.dividend_history(&ticker).await,
                         FetchType::SplitHistory => self_clone.split_history(&ticker).await,
-                        _ => unreachable!(),
+                        _ => return Err(StockError::TaskError(format!("Invalid task: {}", fetch_type))),
                     }
                 };
     
@@ -349,12 +348,12 @@ impl StockPolling {
                 match result {
                     Ok(value) => {
                         counter!("stock.success").increment(1);
-                        value
+                        Ok(value)
                     }
                     Err(e) => {
                         error!("Failed to fetch data for {}: {:?}", ticker, e);
                         counter!("stock.failures").increment(1);
-                        Value::Null
+                        return Err(e);
                     }
                 }
             });
@@ -366,15 +365,16 @@ impl StockPolling {
         let mut results = Vec::new();
         for task in tasks {
             match task.await {
-                Ok(value) => results.push(value),
-                Err(_) => results.push(Value::Null), // Task panicked
+                Ok(Ok(value)) => results.push(value),
+                Ok(Err(err)) => return Err(err),
+                Err(err) => return Err(StockError::FetchError(err.to_string())), // Task panicked
             }
         }
     
         let elapsed = start.elapsed();
         gauge!("stock.batch_time", "rate limit" => format!("{}", elapsed.as_secs_f64()));
     
-        Value::Array(results)
+        Ok(Value::Array(results))
     }
 
    
@@ -407,18 +407,18 @@ impl StockPolling {
             futures.push(future);
         }
 
-        let mut results = Vec::new();
-        for future in futures {
-            match future.await {
-                Ok(value) => results.push(value),
-                Err(e) => {
-                    error!("Failed to fetch data: {}", e);
-                    results.push(Value::Null)
-                }
-            }
-        }
+        let mut results = futures_util::future::join_all(futures).await;
 
-        Ok(Value::Array(results))
+        let final_results: Result<Vec<Value>, StockError> = results
+            .into_iter()
+            .flatten()
+            .map(|res| res.map_err(|e| StockError::FetchError(e.to_string())))
+            .collect::<Result<Vec<_>, _>>();
+
+        match final_results {
+            Ok(values) => Ok(Value::Array(values)),
+            Err(e) => Err(e),
+        }
     }
 
 

@@ -16,7 +16,7 @@ pub mod request;
 //pub mod search;
 pub mod stock;
 pub mod technical_indicators;
-//pub mod economic_data;
+pub mod economic_data;
 pub mod websocket;
 pub mod utils;
 pub mod request_parser;
@@ -32,6 +32,7 @@ use crate::crypto::CryptoPolling;
 use crate::forex::ForexPolling;
 use crate::market::MarketPolling;
 use crate::technical_indicators::TechnicalIndicatorPolling;
+use crate::economic_data::EconomicDataPolling;
 use crate::cache::SharedLockedCache;
 use crate::request::HTTPClient;
 use config::{BatchConfig, RetryConfig};
@@ -46,14 +47,11 @@ async fn main() {
     let batch_config = Arc::new(BatchConfig::default());
     let retry_config = Arc::new(RetryConfig::default());
     let http_client = Arc::new(HTTPClient::new().expect("Failed to create HTTP client"));
-    let polling = TechnicalIndicatorPolling::new( http_client, cache, batch_config, retry_config);
+    let polling = StockPolling::new( http_client, cache, batch_config, retry_config);
 
     let r = polling.poll(&json!({
-        "tickers": ["BTC"],
-        "fetch_type": "technical_indicator",
-        "indicator": "sma",
-        "timeframe": "1day",
-        "period": 10,
+        "tickers": ["MSFT", "AAPL", "DIS", "JPM"],
+        "fetch_type": "profile",
     })).await;
     println!("{:?}", r);
 }

@@ -129,6 +129,7 @@ impl DateTime {
 //-----------------------FetchType---------------: START
 #[derive(Debug, Clone, Copy)]
 pub enum FetchType {
+    Unknownn,
     Quote,
     Financial,
     Profile,
@@ -146,7 +147,11 @@ pub enum FetchType {
     SectorHistorical,
     IndustryPERatio,
     SectorPERatio,
-    TechnicalIndicator
+    TechnicalIndicator,
+    TreasuryRate,
+    MarketIndicator,
+    MarketRiskPremium,
+    MarketCalendar,
 }
 impl FetchType {
     pub fn from_str(s: &str) -> Self {
@@ -169,7 +174,41 @@ impl FetchType {
             "industry_pe_ratio" => FetchType::IndustryPERatio,
             "sector_pe_ratio" => FetchType::SectorPERatio,
             "technical_indicator" => FetchType::TechnicalIndicator,
-            _ => unreachable!(),
+            "treasury_rate" => FetchType::TreasuryRate,
+            "market_indicator" => FetchType::MarketIndicator,
+            "market_risk_premium" => FetchType::MarketRiskPremium,
+            "market_calendar" => FetchType::MarketCalendar,
+            _ => FetchType::Unknownn,
+        }
+    }
+}
+
+impl Display for FetchType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchType::Quote => write!(f, "Quote"),
+            FetchType::Financial => write!(f, "Financial"),
+            FetchType::Profile => write!(f, "Profile"),
+            FetchType::Rating => write!(f, "Rating"),
+            FetchType::Outlook => write!(f, "Outlook"),
+            FetchType::History => write!(f, "History"),
+            FetchType::DividendHistory => write!(f, "Dividend History"),
+            FetchType::SplitHistory => write!(f, "Split History"),
+            FetchType::IntraDay => write!(f, "IntraDay"),
+            FetchType::Daily => write!(f, "Daily"),
+            FetchType::Gainers => write!(f, "Gainers"),
+            FetchType::Losers => write!(f, "Losers"),
+            FetchType::Actives => write!(f, "Actives"),
+            FetchType::Performance => write!(f, "Performance"),
+            FetchType::SectorHistorical => write!(f, "Sector Historical"),
+            FetchType::IndustryPERatio => write!(f, "Industry PERatio"),
+            FetchType::SectorPERatio => write!(f, "Sector PERatio"),
+            FetchType::TechnicalIndicator => write!(f, "Technical Indicator"),
+            FetchType::TreasuryRate => write!(f, "Treasury Rate"),
+            FetchType::MarketIndicator => write!(f, "Market Indicator"),
+            FetchType::MarketRiskPremium => write!(f, "Market Risk Premium"),
+            FetchType::MarketCalendar => write!(f, "Market Calendar"),
+            FetchType::Unknownn => write!(f, "Unknown"),
         }
     }
 }
@@ -264,3 +303,93 @@ impl Display for IndicatorType {
     }
 }
 //-----------------IndicatorType----------------: END
+
+//-----------------EconomicIndicatorType----------------: START
+pub enum EconomicIndicatorType {
+    GDP, 
+    realGDP, 
+    nominalPotentialGDP, 
+    realGDPPerCapita, 
+    federalFunds, 
+    CPI, 
+    inflationRate, 
+    inflation, 
+    retailSales, 
+    consumerSentiment, 
+    durableGoods, 
+    unemploymentRate
+}
+impl EconomicIndicatorType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "gdp" => Some(Self::GDP),
+            "realgdp" => Some(Self::realGDP),
+            "nominalpotentialgdp" => Some(Self::nominalPotentialGDP),
+            "realgdpcapita" => Some(Self::realGDPPerCapita),
+            "federalfunds" => Some(Self::federalFunds),
+            "cpi" => Some(Self::CPI),
+            "inflationrate" => Some(Self::inflationRate),
+            "inflation" => Some(Self::inflation),
+            "retailsales" => Some(Self::retailSales),
+            "consumersentiment" => Some(Self::consumerSentiment),
+            "durablegoods" => Some(Self::durableGoods),
+            "unemploymentrate" => Some(Self::unemploymentRate),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::GDP => "GDP",
+            Self::realGDP => "realGDP",
+            Self::nominalPotentialGDP => "nominalPotentialGDP",
+            Self::realGDPPerCapita => "realGDPPerCapita",
+            Self::federalFunds => "federalFunds",
+            Self::CPI => "CPI",
+            Self::inflationRate => "inflationRate",
+            Self::inflation => "inflation",
+            Self::retailSales => "retailSales",
+            Self::consumerSentiment => "consumerSentiment",
+            Self::durableGoods => "durableGoods",
+            Self::unemploymentRate => "unemploymentRate"
+        }
+    }
+}
+
+impl Display for EconomicIndicatorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+//-----------------EconomicIndicatorType----------------: END
+
+
+//-----------------EconomicData----------------: START
+pub enum EconomicData {
+    Treasury,
+    Indicator,
+    RiskPremium,
+}
+impl EconomicData {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "treasury" => Some(Self::Treasury),
+            "indicator" => Some(Self::Indicator),
+            "riskpremium" => Some(Self::RiskPremium),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Treasury => "treasury",
+            Self::Indicator => "indicator",
+            Self::RiskPremium => "riskPremium"
+        }
+    }
+}
+impl Display for EconomicData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+//-----------------EconomicData----------------: END

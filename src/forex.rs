@@ -183,9 +183,9 @@ impl ForexPolling {
         timeframe: Option<String>,
         from: Option<String>,
         to: Option<String>,
-    ) -> Value {
+    ) -> Result<Value, ForexError> {
         if batch.is_empty() {
-            return Value::Null;
+            return Ok(Value::Null);
         }
     
         let mut tasks = vec![];
@@ -213,16 +213,16 @@ impl ForexPolling {
                 Ok(Ok(value)) => values.push(value),
                 Ok(Err(e)) => {
                     error!("Failed to fetch data: {:?}", e);
-                    values.push(json!({"error": e.to_string()}));
+                    return Err(e);
                 }
                 Err(e) => {
                     error!("Task panicked: {:?}", e);
-                    values.push(json!({"error": "Task panicked"}));
+                    return Err(ForexError::FetchError(e.to_string()));
                 }
             }
         }
 
-        serde_json::json!(values)
+        Ok(Value::Array(values))
     }
     
 
@@ -303,20 +303,18 @@ impl ForexPolling {
             tasks.push(task);
         }
     
-        let results: Vec<_> = futures_util::future::join_all(tasks).await;
-        let mut values = vec![];
-    
-        for result in results {
-            match result {
-                Ok(value) => values.push(value),
-                Err(e) => {
-                    error!("Task failure: {:?}", e);
-                    values.push(json!({"error": "Task panicked"}));
-                }
-            }
+        let mut results = futures_util::future::join_all(tasks).await;
+
+        let final_results: Result<Vec<Value>, ForexError> = results
+            .into_iter()
+            .flatten()
+            .map(|res| res.map_err(|e| ForexError::FetchError(e.to_string())))
+            .collect::<Result<Vec<_>, _>>();
+
+        match final_results {
+            Ok(values) => Ok(Value::Array(values)),
+            Err(e) => Err(e),
         }
-    
-        Ok(Value::Array(values))
     }
 
     pub async fn poll(&self, value: &Value) -> Result<Value, ForexError> {
@@ -334,7 +332,10 @@ impl ForexPolling {
 
     let fetch_type = FetchType::from_str(fetch_type_str);
 
-    let timeframe = value.get("timeframe").and_then(Value::as_str).map(String::from);
+    let timeframe = value.get("timeframe")
+        .and_then(Value::as_str)
+        .map(String::from);
+
     let from = value.get("from").and_then(Value::as_str).map(String::from);
     let to = value.get("to").and_then(Value::as_str).map(String::from);
     
