@@ -2,8 +2,12 @@ use std::sync::Arc;
 use std::collections::HashMap;
 
 use reqwest::Client;
-use crate::config::Config;
 use serde_json::Value;
+use tracing::{info, error};
+use tracing_subscriber;
+
+use crate::config::Config;
+use crate::logging::{LogLevel, Logger};
 
 #[derive(Debug, Clone)]
 pub struct HTTPClient {
@@ -20,6 +24,7 @@ const MAX_CLIENT_POOL_SIZE: usize = 1024;
 
 impl HTTPClient {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Logger::init(LogLevel::Trace);
         Ok(Self {
             client: Arc::new(Client::builder()
             .pool_max_idle_per_host(MAX_CLIENT_POOL_SIZE)
@@ -66,7 +71,11 @@ impl HTTPClient {
     }
 
     pub async fn get(&self, url: &str, query_params: Option<Vec<(String, String)>>) -> Result<Value, reqwest::Error> {
-        println!("Maiking request with query: {:?}", query_params);
+        info!(
+            name: "running",
+            target: "v3 http request",
+            query = format!("{:?}",query_params),
+        );
         let url = format!("{}/{}", self.base_url.trim_end_matches("/"), url.trim_start_matches("/"));
 
         if let Some(query_params) = query_params {
@@ -84,7 +93,11 @@ impl HTTPClient {
     }
 
     pub async fn get_v4(&self, url: &str, query_params: Option<Vec<(String, String)>>) -> Result<Value, reqwest::Error> {
-        println!("Maiking request with query: {:?}", query_params);
+        info!(
+            name: "running",
+            target: "v4 http request",
+            query = format!("{:?}",query_params),
+        );
         let url = format!("{}/{}", self.base_url_v4.trim_end_matches("/"), url.trim_start_matches("/"));
 
         if let Some(query_params) = query_params {

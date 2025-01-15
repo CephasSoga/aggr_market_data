@@ -22,6 +22,7 @@ pub mod utils;
 pub mod request_parser;
 pub mod options;
 //pub mod test;
+pub mod logging;
 
 use serde_json::json;
 use tokio;
@@ -48,11 +49,11 @@ async fn main() {
     let batch_config = Arc::new(BatchConfig::default());
     let retry_config = Arc::new(RetryConfig::default());
     let http_client = Arc::new(HTTPClient::new().expect("Failed to create HTTP client"));
-    let polling = CryptoPolling::new( http_client, cache, batch_config, retry_config);
+    let polling = StockPolling::new( http_client, cache, batch_config, retry_config);
 
     let r = polling.poll(&json!({
-        "tickers": ["BTC", "ETH"],
-        "fetch_type": "daily",
+        "tickers": ["AAPL"],
+        "fetch_type": "profile",
     })).await;
-    println!("{:?}", r);
+    println!("\n***\nResult: {:?}\n***", r);
 }
