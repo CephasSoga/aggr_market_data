@@ -43,7 +43,7 @@ use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() {
-    //let _ = websocket::run().await;
+    let _ = websocket::run().await;
 
     let cache = Arc::new(Mutex::new(SharedLockedCache::new(1000)));
     let batch_config = Arc::new(BatchConfig::default());

@@ -2,6 +2,11 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::pin::Pin;
+
 use futures_util::{SinkExt, StreamExt, Future};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -13,22 +18,21 @@ use tungstenite::protocol::WebSocketConfig;
 use tokio::net::lookup_host;
 use serde_json::{to_value, from_str, Value};
 use serde::{Serialize, Deserialize};
+use tracing::{error, info, warn};
+
+use crate::logging::{LogLevel, Logger};
 use crate::config::{RetryConfig, BatchConfig};
 use crate::cache::SharedLockedCache;
 use crate::request_parser::parser::CallParser;
 use crate::request_parser::params::*;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::pin::Pin;
-
 use crate::request::HTTPClient;
 use crate::stock::StockPolling;
-//use crate::crypto::CryptoPolling;
-//use crate::forex::ForexPolling;
-//use crate::economic_data::EconomicDataPolling;
-//use crate::technical_indicators::TechnicalIndicatorPolling;
-//use crate::market::MarketPolling;
+use crate::crypto::CryptoPolling;
+use crate::forex::ForexPolling;
+use crate::index::IndexPolling;
+use crate::economic_data::EconomicDataPolling;
+use crate::technical_indicators::TechnicalIndicatorPolling;
+use crate::market::MarketPolling;
 
 const REQUEST_SUCCUESS: u32 = 200;
 const REQUEST_FAILED: u32 = 400;
@@ -65,29 +69,30 @@ impl ServerSocket {
         }
     }
 
+
     pub async fn run(&mut self) -> Result<(), Error> {
-        println!("Resolving address: {}", self.address);
+        info!(message="Resolving address", addr=self.address);
         let mut addrs = lookup_host(&self.address).await
             .map_err(|e| println!("Error resolving address: {}", e.to_string()))
             .unwrap();
 
         let addr = addrs.next().ok_or_else(|| {
-            println!("No address found for: {}", self.address);
+            error!(err="Failed to resolve address", addr=self.address);
             Error::Url(tungstenite::error::UrlError::NoHostName)
         })?;
 
-        println!("Setting address: {}", self.address);
+        info!("Setting address: {}", self.address);
         let listener = TcpListener::bind(&addr).await
             .map_err(|e| println!("Error: {}", e.to_string()))
             .unwrap();
 
-        println!("Building RMake...");
+        info!("Building RMake...");
         let _ = self.make.build();
 
         println!("WebSocket server listening on: {}", self.address);
 
         while let Ok((stream, addr)) = listener.accept().await {
-            println!("New connection from: {}", addr);
+            info!("New connection from: {}", addr);
             tokio::spawn(Self::handle_connection(stream, self.make.clone(), self.state.clone()));
         }
 
@@ -101,7 +106,7 @@ impl ServerSocket {
         let ws_stream = match accept_async_with_config(stream, config).await {
             Ok(ws_stream) => ws_stream,
             Err(e) => {
-                println!("Error during handshake: {}", e);
+                error!("Error during handshake: {}", e);
                 return;
             }
         };
@@ -125,16 +130,16 @@ impl ServerSocket {
                     match serde_json::from_str::<Value>(&text) {
                         Ok(_json) => {
                             let state = Arc::clone(&state);
-                            println!("Making Response...");
+                            info!("Making Response...");
                             let response = make.make(state, &text).await;
-                            println!("Sending response...");
+                            info!("Sending response...");
                             if let Err(_) = tx.send(format!("{}", &response)).await {
                                 break;
                             }
-                            println!("Response sent");
+                            info!("Response sent.");
                         }
                         Err(e) => {
-                            println!("Failed to parse JSON: {}", e);
+                            error!("Failed to parse JSON: {}", e);
                             if let Err(_) = tx.send("Invalid JSON".to_string()).await {
                                 break;
                             }
@@ -143,7 +148,7 @@ impl ServerSocket {
                 }
                 Ok(Message::Close(_)) => break,
                 Err(e) => {
-                    println!("Error receiving message: {}", e);
+                    warn!("Error receiving message: {}", e);
                     break;
                 }
                 _ => {}
@@ -189,9 +194,152 @@ impl Collection {
         
     }
 
-    fn stock_polling_func(state: Arc<PollState>, args: Arc<Value>) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+    async fn crypto_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
+        let crypto_polling = CryptoPolling::new(
+            state.http_client.clone(),
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.retry_config.clone(),
+        );
+        crypto_polling
+            .poll(&args)
+            .await
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Crypto polling failed: {}", e)))
+        
+    }
+
+    async fn forex_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
+        let forex_polling = ForexPolling::new(
+            state.http_client.clone(),
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.retry_config.clone(),
+        );
+        forex_polling
+            .poll(&args)
+            .await
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Forex polling failed: {}", e)))
+        
+    }
+
+    async fn index_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
+        let index_polling = IndexPolling::new(
+            state.http_client.clone(),
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.retry_config.clone(),
+        );
+        index_polling
+            .poll(&args)
+            .await
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Index polling failed: {}", e)))
+    }
+
+    async fn technical_indicators_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
+        let technical_indicators_polling = TechnicalIndicatorPolling::new(
+            state.http_client.clone(),
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.retry_config.clone(),
+        );
+        technical_indicators_polling
+            .poll(&args)
+            .await
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Technical Indicators polling failed: {}", e)))
+    }
+
+    async fn economic_data_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
+        let economic_data_polling = EconomicDataPolling::new(
+            state.http_client.clone(),
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.retry_config.clone(),
+        );
+        economic_data_polling
+            .poll(&args)
+            .await
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Economic Data polling failed: {}", e)))
+    }
+
+    async fn market_data_polling_unpinned(state: Arc<PollState>, args: Arc<Value>) -> Value{
+        let market_data_polling = MarketPolling::new(
+            state.http_client.clone(),
+            state.cache.clone(), 
+            state.batch_config.clone(),
+            state.retry_config.clone(),
+        );
+        market_data_polling
+            .poll(&args)
+            .await
+            .map(|v| v)
+            .unwrap_or_else(|e| Value::String(format!("Market Data polling failed: {}", e)))
+    }
+
+    fn stock_polling_func(
+        state: Arc<PollState>, 
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
         Box::pin(async move {
             Collection::stock_polling_unpinned(state, args).await
+        })
+    }
+
+    fn crypto_polling_func(
+        state: Arc<PollState>, 
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::crypto_polling_unpinned(state, args).await
+        })
+    }
+
+    fn forex_polling_func(
+        state: Arc<PollState>,
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::forex_polling_unpinned(state, args).await
+        })
+    }
+
+    fn index_polling_func(
+        state: Arc<PollState>, 
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::index_polling_unpinned(state, args).await
+        })
+    }
+
+    fn technical_indicators_polling_func(
+        state: Arc<PollState>, 
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::technical_indicators_polling_unpinned(state, args).await
+        })
+    }
+
+    fn economic_data_polling_func(
+        state: Arc<PollState>, 
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::economic_data_polling_unpinned(state, args).await
+        })
+    }
+
+    fn market_data_polling_func(
+        state: Arc<PollState>, 
+        args: Arc<Value>
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'static>> {
+        Box::pin(async move {
+            Collection::market_data_polling_unpinned(state, args).await
         })
     }
     
@@ -217,6 +365,12 @@ impl MakeResponse {
 
     pub fn build(&mut self) {
         self.register_function("stock_polling".to_string(), Collection::stock_polling_func);
+        self.register_function("crypto_polling".to_string(), Collection::crypto_polling_func);
+        self.register_function("forex_polling".to_string(), Collection::forex_polling_func);
+        self.register_function("index_polling".to_string(), Collection::index_polling_func);
+        self.register_function("technical_indicators_polling".to_string(), Collection::technical_indicators_polling_func);
+        self.register_function("economic_data_polling".to_string(), Collection::economic_data_polling_func);
+        self.register_function("market_data_polling".to_string(), Collection::market_data_polling_func);
     }
 
     pub async fn unsafe_make(&self, state: Arc<PollState>, s: &str) -> Value {
@@ -269,15 +423,15 @@ impl MakeResponse {
     }
     async fn handle_task(&self, state: Arc<PollState>, task_args: TaskArgs) -> Value {
         let where_ = task_args.look_for.where_;
-        println!("Extracting Args...");
+        info!("Extracting Args...");
         if let Some(args) = task_args.params {
-            println!("Executing task function: {}", &where_);
+            info!("Executing task function: {}", &where_);
             if let Some(func) = self.map_func(&where_) {
                 let args = Arc::new(to_value(args).unwrap());
                 let result = func(state, args).await;
                 return self.return_success(result);
             } else {
-                println!("Invalid task function: {}", &where_);
+                error!("Invalid task function: {}", &where_);
                 return self.return_error(Outcome::Failure, format!("Invalid task function: {}", &where_));
             }
         }

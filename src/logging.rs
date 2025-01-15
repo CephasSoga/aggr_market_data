@@ -1,5 +1,6 @@
-use tracing::{info, debug, error, warn, trace};
+use tracing::{span, info, debug, error, warn, trace};
 use tracing_subscriber;
+use tracing_subscriber::FmtSubscriber;
 
 pub enum LogLevel {
     Trace, Info, Debug, Warn, Error
@@ -32,6 +33,7 @@ impl Default for LogLevel {
     }
 }
 
+const SPAN_NAME: &str = "Aggr. market polling";
 pub struct Logger;
 
 impl Logger {
@@ -40,6 +42,18 @@ impl Logger {
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE) // Set the maximum log level
             .init();
+    }
+
+    pub fn init_with_subscriber() {
+        let subscriber = FmtSubscriber::builder().finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("Setting default subscriber failed.");
+    }
+
+    pub fn with_span<T>(level: LogLevel, f: impl FnOnce() -> T) -> T {
+        let span = span!(tracing::Level::INFO, SPAN_NAME);
+        let _guard = span.enter(); // Enter the span context
+        f() // Execute the function within the span
     }
 
     /// Log a trace-level message
