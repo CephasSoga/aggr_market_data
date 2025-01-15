@@ -2,10 +2,9 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
-
 use std::sync::Arc;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
 use futures_util::Future;
 use metrics::{counter, gauge};
 use tracing::{info, error};

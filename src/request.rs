@@ -1,6 +1,7 @@
-use reqwest::Client;
 use std::sync::Arc;
 use std::collections::HashMap;
+
+use reqwest::Client;
 use crate::config::Config;
 use serde_json::Value;
 

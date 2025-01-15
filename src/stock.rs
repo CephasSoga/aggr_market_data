@@ -2,26 +2,24 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
-use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crate::request::HTTPClient;
-use crate::financial::Financial;
 use serde::de::value;
 use tokio::time::sleep;
 use serde_json::{json, to_value, Value};
 use tokio::sync::Semaphore;
-use std::time::{Duration, Instant};
 use metrics::{counter, gauge};
 use tracing::{info, error};
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use futures_util::Future;
 use lru::LruCache;
 use tokio::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::request::HTTPClient;
+use crate::financial::Financial;
 use crate::utils::{retry, clone_str_options, clone_arc_refs};
 use crate::options::FetchType;
 use crate::config::{RetryConfig, BatchConfig};

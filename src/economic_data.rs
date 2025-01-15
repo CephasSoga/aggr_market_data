@@ -2,23 +2,23 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
-use crate::request::HTTPClient;
-use clap::builder::Str;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 use tracing_subscriber::fmt::format;
-use tungstenite::http;
 use std::collections::HashMap;
 use tokio::sync::{Mutex, Semaphore};
-use std::time::{Duration, Instant};
 use metrics::{counter, gauge};
 use tracing::{info, error};
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use futures_util::Future;
 use std::fmt::Display;
 use thiserror::Error;
+
+use crate::utils::retry;
+use crate::request::HTTPClient;
 use crate::config::{TimeConfig, BatchConfig, RetryConfig};
-use crate::utils::{now, ago_secs, retry};
 use crate::options::{FetchType, EconomicData, EconomicIndicatorType};
 use crate::cache::{Cache, SharedLockedCache};
 

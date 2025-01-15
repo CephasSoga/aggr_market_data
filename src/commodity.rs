@@ -2,22 +2,21 @@
 #![allow(warnings)]
 #![allow(unused_variables)]
 
-use crate::request::HTTPClient;
-use clap::builder::Str;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use tokio::sync::Semaphore;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, error};
 use metrics::{counter, gauge};
-use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use std::collections::HashSet;
-use std::sync::Arc;
 use thiserror::Error;
 use futures_util::Future;
 use tokio::sync::Mutex;
 
+use crate::request::HTTPClient;
 use crate::config::{RetryConfig, BatchConfig};
 use crate::options::{TimeFrame, DateTime, FetchType};
 use crate::cache::{Cache,  SharedLockedCache};

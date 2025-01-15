@@ -1,9 +1,9 @@
 use std::fmt;
 use std::hash::Hash;
+use std::time::Duration;
 
 use serde::Deserialize;
 use config::{builder::DefaultState, ConfigBuilder, ConfigError, File};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Hash, Deserialize)]
 pub struct ConfigHeader {

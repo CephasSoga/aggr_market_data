@@ -173,9 +173,9 @@ impl CryptoPolling {
         timeframe: Option<String>,
         from: Option<String>,
         to: Option<String>,
-    ) -> Value {
+    ) -> Result<Value, CryptoError> {
         if batch.is_empty() {
-            return Value::Null;
+            return Ok(Value::Null);
         }
     
         let mut tasks = vec![];
@@ -203,16 +203,15 @@ impl CryptoPolling {
                 Ok(Ok(value)) => values.push(value),
                 Ok(Err(e)) => {
                     error!("Failed to fetch data: {:?}", e);
-                    values.push(json!({"error": e.to_string()}));
+                    return Err(e);
                 }
                 Err(e) => {
                     error!("Task panicked: {:?}", e);
-                    values.push(json!({"error": "Task panicked"}));
+                    return Err(CryptoError::FetchError(e.to_string()));
                 }
             }
         }
-
-        serde_json::json!(values)
+        Ok(Value::Array(values))
     }
     
     fn clone(&self) -> Self {
@@ -300,19 +299,17 @@ impl CryptoPolling {
         }
     
         let results: Vec<_> = futures_util::future::join_all(tasks).await;
-        let mut values = vec![];
-    
-        for result in results {
-            match result {
-                Ok(value) => values.push(value),
-                Err(e) => {
-                    error!("Task failure: {:?}", e);
-                    values.push(json!({"error": "Task panicked"}));
-                }
-            }
+        
+        let final_results: Result<Vec<Value>, CryptoError> = results
+            .into_iter()
+            .flatten()
+            .map(|res| res.map_err(|e| CryptoError::FetchError(e.to_string())))
+            .collect::<Result<Vec<_>, _>>();
+
+        match final_results {
+            Ok(values) => Ok(Value::Array(values)),
+            Err(e) => Err(e),
         }
-    
-        Ok(Value::Array(values))
     }
 
     pub async fn poll(&self, args: &Value) -> Result<Value, CryptoError> {
